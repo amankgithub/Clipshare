@@ -10,8 +10,9 @@ import com.clipbridge.BridgeService
 import com.clipbridge.features.files.ContentSource
 
 /**
- * Share target: SEND for text, SEND / SEND_MULTIPLE for any files. Images go through the clipboard
- * image path (converted to PNG); every other file, and any image too big for a clip, goes through file transfer.
+ * Share target: SEND for text, SEND / SEND_MULTIPLE for any files. A share of exactly one image that fits a clip goes
+ * through the clipboard image path (converted to PNG); anything else goes through file transfer as the original
+ * files, so one share never splits between the PC clipboard and Downloads\ClipShare.
  */
 class ShareTargetActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -37,9 +38,10 @@ class ShareTargetActivity : Activity() {
     private fun sendUris(uris: List<Uri>) {
         var images = 0
         val files = ArrayList<ContentSource>()
+        val single = uris.size == 1
         for (uri in uris) {
             val file = ContentSource.open(this, uri)
-            val png = if (isImage(uri) && (file == null || file.size <= ImageUtil.MAX_BYTES)) {
+            val png = if (single && isImage(uri) && (file == null || file.size <= ImageUtil.MAX_BYTES)) {
                 ImageUtil.readPng(this, uri)?.takeIf { it.isNotEmpty() && it.size <= ImageUtil.MAX_BYTES }
             } else null
             if (png != null) { file?.close(); BridgeService.submitImage(this, png); images++ }

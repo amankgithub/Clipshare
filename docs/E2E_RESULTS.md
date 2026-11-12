@@ -23,3 +23,15 @@ Gotcha: the Claude desktop tool shell virtualizes %APPDATA%/%LOCALAPPDATA%, so `
 Not tested: PC sleep/resume, PC reboot/logon trigger, kill-pythonw restart.
 
 Earlier observation (probably the same PSK mismatch): one unexplained "auth failed (bad MAC)" from the phone at 14:30:44 while the user was toggling Wi-Fi; not reproduced in a controlled Wi-Fi toggle. Self-recovered.
+
+## Images, share target, screenshot tile (2026-11-12)
+Setup: merged `claude/win-images-*` and `claude/android-images-*`; Pillow installed in `windows/.venv` (`pip install -e windows`); APK via `setup.ps1`; `pm grant com.clipbridge android.permission.READ_MEDIA_IMAGES`.
+
+- Phone to PC, share sheet (adb `SEND image/jpeg` of the newest screenshot, 1080p JPEG): phone logged `send image len=251788`; PC saved `Pictures\ClipBridge\clip_20261112_152208.png` (251 788 bytes) and set the clipboard. No echo back to the phone. PASS
+- PC to phone: image set on the Windows clipboard (320x200 PNG). Phone logged `remote image len=672 applied=true`; `cache/clips/latest.png` written. No echo back. PASS
+- Text sync still works after the merge (phone received a 455-char PC clip). PASS
+
+Not tested yet (needs hands on the phone): pasting the received image into an app; "Send screenshot" tile (must be added to the QS panel first, `cmd statusbar click-tile` did nothing when it was not added); share from a real app UI; 10 MB photo; >16 MiB skip.
+
+Note: .NET `Clipboard.SetImage` threw "Requested Clipboard operation did not succeed" while the data was still delivered; likely the daemon opening the clipboard during the setter's flush. Watch for this with real apps.
+Gotcha: the tool shell's `%LOCALAPPDATA%` is virtualized too, so the real daemon log cannot be read from it.

@@ -141,5 +141,6 @@ Crypto/JSON cost <1 ms. Spike (Phase 0) measures the real phone→PC number.
 - Password manager copy on Windows not synced.
 
 ## Out of scope v1 (designed to slot in)
-Images (`kind:"image"` + binary payload), file transfer, tray UI, clipboard history.
+Done since v1: image clips both ways, share target (text + images), "Send screenshot" QS tile.
+Still out: file transfer (idea: shared files go quietly into a fixed laptop folder), tray UI, clipboard history.
 - TODO: AccessibilityService auto-trigger for phone→PC (detect Copy action / "Copied" toast, then `ReaderActivityTrigger(this).requestRead()`); sideloaded apps need "Allow restricted settings". Untested on the V2502; the `ClipTrigger` seam is already in place.

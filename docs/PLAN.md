@@ -199,7 +199,7 @@ On the extender, Wi-Fi stalls of 10–20 s drop the link; the transfer reconnect
 8. Windows shell: `clipbridge send` + named pipe, context-menu verb, SendTo shortcut, `uninstall --purge`.
 9. Android: `link/Transfer.kt` (data connections over OkHttp, Wi-Fi lock), `features/files/`, share target for any file. Independent of 7–8 (works from the spec) → can run in parallel.
 10. File transfer end to end on the vivo + speed benchmark (`STREAMS` 1 vs 3 against a raw-socket ceiling).
-11. Review fixes: the top 5 of `docs/REVIEW.md` (PSK out of backups, per-device keys, network exposure and pre-auth limits, manual-host crash, clipboard privacy formats), then B2/B3 (lost `xfer_done`, disk errors and missing timeouts).
+11. Review fixes from `docs/REVIEW.md`: PSK and device id out of backups, network exposure and pre-auth limits, manual-host crash, clipboard privacy formats (the top 5 minus per-device keys, which come with step 12), then B2/B3 (lost `xfer_done`, disk errors and missing timeouts).
 12. Link: `hello` + device registry + per-device keys (`PROTOCOL.md` §2/§3), then request/response.
 13. Link: streams; file transfer moves onto them; large clip bodies leave the control connection.
 14. Platform and entry layers (Target layering): extract clipboard access, notifications/tray, settings, storage, power and the command bus; share router in `entry/`; per-feature serial queues; `CLAUDE.md` layout and layering rule updated. No behaviour change; tests stay green.

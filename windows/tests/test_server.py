@@ -113,6 +113,38 @@ async def test_relay_between_clients(env) -> None:
         await asyncio.wait_for(b.recv(), 0.5)
 
 
+PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(200))
+
+
+def image_clip() -> dict:
+    return {"ch": "clipboard", "type": "clip", "kind": "image", "mime": "image/png", "ts": 1}
+
+
+async def test_image_relay_between_clients(tmp_path) -> None:
+    link = Link(PSK, host="127.0.0.1", port=0)
+    images: list[bytes] = []
+    link.register(ClipboardFeature(link, lambda t: None, images.append, save_dir=tmp_path))
+    await link.start()
+    try:
+        a = await TestClient.connect(link.port, PSK, "phone-a")
+        b = await TestClient.connect(link.port, PSK, "phone-b")
+        await asyncio.sleep(0.1)
+        await a.send(image_clip(), PNG)
+        header, body = await asyncio.wait_for(b.recv(), 5)
+        assert header["kind"] == "image" and header["mime"] == "image/png" and "data" not in header
+        assert body == PNG
+        assert images == [PNG]
+        assert [p.read_bytes() for p in tmp_path.glob("clip_*.png")] == [PNG]
+        # echo drop; bad mime and empty body ignored
+        await a.send(image_clip(), PNG)
+        await a.send({**image_clip(), "mime": "image/jpeg"}, b"x")
+        await a.send(image_clip(), b"")
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(b.recv(), 0.5)
+    finally:
+        await link.stop()
+
+
 async def test_duplicate_device_replaces_older_4409(env) -> None:
     link, _ = env
     old = await TestClient.connect(link.port, PSK, "same")

@@ -3,39 +3,52 @@
 from __future__ import annotations
 
 import hashlib
+from typing import NamedTuple
+
+
+class Clip(NamedTuple):
+    """kind "text": data is str. kind "image": data is PNG bytes."""
+
+    kind: str
+    data: str | bytes
+
+
+def clip_hash(clip: Clip) -> bytes:
+    raw = clip.data.encode("utf-8") if isinstance(clip.data, str) else clip.data
+    return hashlib.sha256(raw).digest()
 
 
 def text_hash(text: str) -> bytes:
-    return hashlib.sha256(text.encode("utf-8")).digest()
+    return clip_hash(Clip("text", text))
 
 
 class SyncEngine:
     def __init__(self) -> None:
-        self._last_hash: bytes | None = None
-        self._pending: str | None = None
+        self._last_hash: bytes | None = None  # shared by text and images
+        self._pending: Clip | None = None
 
-    def on_local(self, text: str, connected: bool) -> str | None:
-        """Local clipboard changed. Return text to send now, else None (dropped or queued)."""
-        digest = text_hash(text)
+    def on_local(self, clip: Clip, connected: bool) -> Clip | None:
+        """Local clipboard changed. Return clip to send now, else None (dropped or queued)."""
+        digest = clip_hash(clip)
         if digest == self._last_hash:
             return None
         self._last_hash = digest
         if connected:
             self._pending = None
-            return text
-        self._pending = text
+            return clip
+        self._pending = clip
         return None
 
-    def on_remote(self, text: str) -> bool:
+    def on_remote(self, clip: Clip) -> bool:
         """Remote clip arrived. Return True if it should be written to the local clipboard."""
-        digest = text_hash(text)
+        digest = clip_hash(clip)
         if digest == self._last_hash:
             return False
         self._last_hash = digest
         self._pending = None
         return True
 
-    def take_pending(self) -> str | None:
+    def take_pending(self) -> Clip | None:
         """On (re)connect: the single unsent local clip, if any."""
-        text, self._pending = self._pending, None
-        return text
+        clip, self._pending = self._pending, None
+        return clip

@@ -63,12 +63,19 @@ async def _run(port: int) -> None:
     advertiser = Advertiser(port)
 
     clip_thread: ClipboardThread
-    feature = ClipboardFeature(link, lambda text: clip_thread.set_text(text))
+    feature = ClipboardFeature(
+        link, lambda text: clip_thread.set_text(text), lambda png: clip_thread.set_image(png)
+    )
 
     def on_text(text: str) -> None:
         asyncio.run_coroutine_threadsafe(feature.on_local_text(text), loop)
 
-    clip_thread = ClipboardThread(on_text, lambda: loop.call_soon_threadsafe(advertiser.request_refresh))
+    def on_image(png: bytes) -> None:
+        asyncio.run_coroutine_threadsafe(feature.on_local_image(png), loop)
+
+    clip_thread = ClipboardThread(
+        on_text, lambda: loop.call_soon_threadsafe(advertiser.request_refresh), on_image
+    )
     link.register(feature)
 
     await link.start()

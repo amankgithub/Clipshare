@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import collections
 import ctypes
+import io
 import logging
+import struct
 import threading
 import time
 from typing import Callable
@@ -14,6 +16,9 @@ import win32api
 import win32clipboard
 import win32con
 import win32gui
+from PIL import Image
+
+CF_DIBV5 = 17
 
 log = logging.getLogger(__name__)
 
@@ -33,11 +38,18 @@ _user32.AddClipboardFormatListener.restype = ctypes.c_int
 
 
 class ClipboardThread(threading.Thread):
-    def __init__(self, on_text: Callable[[str], None], on_resume: Callable[[], None]) -> None:
+    def __init__(
+        self,
+        on_text: Callable[[str], None],
+        on_resume: Callable[[], None],
+        on_image: Callable[[bytes], None] | None = None,
+    ) -> None:
         super().__init__(name="clipboard-win32", daemon=True)
         self._on_text = on_text
+        self._on_image = on_image
         self._on_resume = on_resume
-        self._outbox: collections.deque[str] = collections.deque()
+        self._png_fmt = 0
+        self._outbox: collections.deque[tuple[str, str | bytes]] = collections.deque()
         self._hwnd = 0
         self._ready = threading.Event()
         self._error: BaseException | None = None
@@ -50,7 +62,11 @@ class ClipboardThread(threading.Thread):
             raise RuntimeError(f"clipboard thread failed to start: {self._error}")
 
     def set_text(self, text: str) -> None:
-        self._outbox.append(text)
+        self._outbox.append(("text", text))
+        win32gui.PostMessage(self._hwnd, WM_SET_TEXT, 0, 0)
+
+    def set_image(self, png: bytes) -> None:
+        self._outbox.append(("image", png))
         win32gui.PostMessage(self._hwnd, WM_SET_TEXT, 0, 0)
 
     def stop(self) -> None:
@@ -70,6 +86,7 @@ class ClipboardThread(threading.Thread):
 
     def _create_window(self) -> None:
         self._exclude_fmt = win32clipboard.RegisterClipboardFormat(EXCLUDE_FORMAT)
+        self._png_fmt = win32clipboard.RegisterClipboardFormat("PNG")
         hinst = win32api.GetModuleHandle(None)
         wc = win32gui.WNDCLASS()
         wc.hInstance = hinst
@@ -123,28 +140,92 @@ class ClipboardThread(threading.Thread):
         if win32clipboard.IsClipboardFormatAvailable(self._exclude_fmt):
             log.debug("clip skipped (excluded from monitoring)")
             return
-        if not win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
+        avail = win32clipboard.IsClipboardFormatAvailable
+        if avail(win32con.CF_UNICODETEXT):
+            fmt: int | None = win32con.CF_UNICODETEXT
+        elif self._on_image is None:
+            return
+        elif avail(self._png_fmt):
+            fmt = self._png_fmt
+        elif avail(CF_DIBV5):
+            fmt = CF_DIBV5
+        elif avail(win32con.CF_DIB):
+            fmt = win32con.CF_DIB
+        else:
             return
         if not self._open():
             return
         try:
-            text = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+            data = win32clipboard.GetClipboardData(fmt)
         except pywintypes.error:
             return
         finally:
             win32clipboard.CloseClipboard()
-        if isinstance(text, str) and text:
-            self._on_text(text)
+        if fmt == win32con.CF_UNICODETEXT:
+            if isinstance(data, str) and data:
+                self._on_text(data)
+            return
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            return
+        try:
+            png = bytes(data) if fmt == self._png_fmt else dib_to_png(bytes(data))
+        except Exception:
+            log.warning("clipboard image conversion failed (len=%d)", len(data))
+            return
+        assert self._on_image is not None
+        self._on_image(png)
 
     def _handle_set(self) -> None:
         while self._outbox:
-            text = self._outbox.popleft()
+            kind, data = self._outbox.popleft()
+            try:
+                dib = png_to_dib(data) if kind == "image" else b""  # type: ignore[arg-type]
+            except Exception:
+                log.warning("incoming image conversion failed (len=%d)", len(data))
+                continue
             if not self._open():
                 continue
             try:
                 win32clipboard.EmptyClipboard()
-                win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
+                if kind == "image":
+                    win32clipboard.SetClipboardData(self._png_fmt, data)
+                    win32clipboard.SetClipboardData(win32con.CF_DIB, dib)
+                else:
+                    win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, data)
             except pywintypes.error:
                 log.exception("set clipboard failed")
             finally:
                 win32clipboard.CloseClipboard()
+
+
+def dib_to_png(dib: bytes) -> bytes:
+    """CF_DIB / CF_DIBV5 payload -> PNG bytes (prepend a BMP file header, let Pillow decode)."""
+    hdr_size = struct.unpack_from("<I", dib, 0)[0]
+    bit_count = struct.unpack_from("<H", dib, 14)[0]
+    compression = struct.unpack_from("<I", dib, 16)[0]
+    clr_used = struct.unpack_from("<I", dib, 32)[0]
+    palette = clr_used * 4 if clr_used else (4 << bit_count if bit_count <= 8 else 0)
+    masks = 12 if hdr_size == 40 and compression == 3 else 0  # BI_BITFIELDS
+    offset = 14 + hdr_size + masks + palette
+    bmp = b"BM" + struct.pack("<IHHI", 14 + len(dib), 0, 0, offset) + dib
+    with Image.open(io.BytesIO(bmp)) as im:
+        im.load()
+        out = io.BytesIO()
+        im.save(out, "PNG")
+    return out.getvalue()
+
+
+def png_to_dib(png: bytes) -> bytes:
+    """PNG bytes -> CF_DIB payload (Pillow BMP minus the 14-byte file header; alpha flattened on white)."""
+    with Image.open(io.BytesIO(png)) as im:
+        im.load()
+        if im.mode in ("RGBA", "LA", "P"):
+            rgba = im.convert("RGBA")
+            bg = Image.new("RGB", rgba.size, (255, 255, 255))
+            bg.paste(rgba, mask=rgba.getchannel("A"))
+            im = bg
+        else:
+            im = im.convert("RGB")
+        out = io.BytesIO()
+        im.save(out, "BMP")
+    return out.getvalue()[14:]

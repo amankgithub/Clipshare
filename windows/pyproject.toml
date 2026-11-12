@@ -12,6 +12,7 @@ dependencies = [
     "zeroconf>=0.130",
     "pywin32>=306",
     "cryptography>=42",
+    "Pillow>=10",
 ]
 
 [project.optional-dependencies]

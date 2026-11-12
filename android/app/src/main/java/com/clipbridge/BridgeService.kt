@@ -12,6 +12,7 @@ import android.os.IBinder
 import android.util.Log
 import com.clipbridge.features.clipboard.ClipboardFeature
 import com.clipbridge.features.clipboard.ClipboardWriter
+import com.clipbridge.features.clipboard.ImageDelivery
 import com.clipbridge.features.clipboard.ReaderActivityTrigger
 import com.clipbridge.link.BridgeClient
 import com.clipbridge.link.Discovery
@@ -80,7 +81,8 @@ class BridgeService : Service() {
                     val f = java.io.File(path)
                     val png = runCatching { f.readBytes() }.getOrNull()
                     f.delete()
-                    if (png != null) clipboard.onLocalImage(png)
+                    val report = ImageDelivery.reporter(applicationContext, scope)
+                    if (png != null) clipboard.onLocalImage(png, report) else report(false)
                 }
             }
             ACTION_RECONFIG -> client.reconnect()

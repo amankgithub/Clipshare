@@ -45,6 +45,31 @@ async def test_good_handshake_and_clip(env) -> None:
     await c.ws.close()
 
 
+async def test_receipt_sent_after_feature_handles(env) -> None:
+    link, written = env
+    c = await TestClient.connect(link.port, PSK)
+    await c.send({**clip("a"), "mid": "m1"})
+    header, body = await asyncio.wait_for(c.recv(), 5)
+    assert header == {"ch": "link", "type": "ack", "mid": "m1"} and body == b""
+    assert written == ["a"]
+    await c.send({**clip("a"), "mid": "m2"})  # duplicate clip: ignored on purpose, still acked
+    header, _ = await asyncio.wait_for(c.recv(), 5)
+    assert header["mid"] == "m2"
+    await c.ws.close()
+
+
+async def test_no_receipt_for_invalid_mid_or_unknown_ch(env) -> None:
+    link, _ = env
+    c = await TestClient.connect(link.port, PSK)
+    await c.send({**clip("a"), "mid": "bad mid!"})
+    await c.send({"ch": "nope", "mid": "m1"})
+    await c.send({"ch": "link", "type": "ack", "mid": "m2"})
+    await c.send({**clip("b"), "mid": "ok"})
+    header, _ = await asyncio.wait_for(c.recv(), 5)
+    assert header["mid"] == "ok"
+    await c.ws.close()
+
+
 async def test_wrong_psk_4401(env) -> None:
     link, _ = env
     ws = await connect(f"ws://127.0.0.1:{link.port}/", subprotocols=["clipbridge.v1"])

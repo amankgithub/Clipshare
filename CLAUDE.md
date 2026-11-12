@@ -13,6 +13,18 @@ Clipboard sync is the first feature on that link. Full plan: `docs/PLAN.md`. Wir
 - **Link layer**: discovery, connect/reconnect, handshake, crypto, liveness, peer registry. Knows nothing about features.
 - **Feature layer**: one module per feature (`name`, `on_peer_connected`, `on_peer_disconnected`, `on_message(peer, header, body)`), uses `send(peer|all, header, body)`.
 - Link routes by `header.ch`. Never put feature code or feature names inside the link layer. A new feature = new module + one register line per side.
+- Generic needs (delivery receipts, request/response, file transfer, ...) belong in the link layer as
+  general services any feature can use, never as one feature's special case.
+
+## Adding or changing a feature
+Write it as if the project had been designed with it from day one:
+- Put it where the design says it belongs. If the current structure has no clean place for it,
+  restructure first (move or generalize code), then add the feature. Never bolt on a special case.
+- Update `PROTOCOL.md`, `docs/PLAN.md`, and this file so they read as one design, not a changelog.
+  No "added later", "v2 hack", or "new:" notes in code or docs.
+- Delete code, flags, and docs the change makes obsolete. No dead paths or compatibility shims for
+  builds that only ever ran on your own devices (both sides ship together).
+- Leave the code the next agent would expect: same naming, same module shape as its siblings.
 
 ## Commands
 - Python tests: `pytest windows/tests`

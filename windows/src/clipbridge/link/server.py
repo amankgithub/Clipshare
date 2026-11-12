@@ -14,7 +14,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 
-from clipbridge.link import crypto, envelope, handshake
+from clipbridge.link import crypto, envelope, handshake, receipts
 from clipbridge.link.crypto import CounterExhausted, FrameError, SecureChannel
 from clipbridge.link.envelope import EnvelopeError, EnvelopeTooLarge
 from clipbridge.link.feature import Feature
@@ -160,14 +160,26 @@ class Link:
             except EnvelopeError as exc:
                 log.warning("malformed envelope from %s: %s", peer, exc)
                 continue
-            feature = self._features.get(header["ch"])
-            if feature is None:
-                log.debug("no feature for ch=%r", header["ch"])
-                continue
-            try:
-                await feature.on_message(peer, header, body)
-            except Exception:
-                log.exception("feature %s failed on message", feature.name)
+            await self._route(peer, header, body)
+
+    async def _route(self, peer: Peer, header: dict[str, Any], body: bytes) -> None:
+        ch = header["ch"]
+        if ch.startswith(receipts.LINK_CH):
+            # The server never asks for receipts, so incoming acks have nothing to resolve.
+            log.debug("link control message ch=%r type=%r", ch, header.get("type"))
+            return
+        feature = self._features.get(ch)
+        if feature is None:
+            log.debug("no feature for ch=%r", ch)
+            return
+        try:
+            await feature.on_message(peer, header, body)
+        except Exception:
+            log.exception("feature %s failed on message", feature.name)
+            return
+        mid = receipts.requested_mid(header)
+        if mid is not None:
+            await self.send(peer, receipts.ack(mid))
 
     async def _notify(self, method: str, peer: Peer) -> None:
         for feature in self._features.values():

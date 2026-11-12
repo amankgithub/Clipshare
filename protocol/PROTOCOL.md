@@ -105,7 +105,33 @@ plaintext = header_len (u32, big-endian) ‖ header (header_len bytes, JSON, UTF
   the feature registered under that name. Unknown `ch` → ignore and log at debug level (lets
   either side upgrade first).
 - Within a feature, unknown `type` or `kind` values → ignore. Unknown header keys → ignore.
-- `ch` values starting with `link` are reserved for future link-layer control messages.
+- `ch` values starting with `link` are reserved for link-layer control messages (section 6.1).
+  They are handled by the link and never delivered to a feature.
+- The header key `mid` is reserved for the link (section 6.1); features must not use it.
+
+### 6.1 Delivery receipts (`ch = "link"`)
+
+Any feature message may ask for a receipt, so the sender learns that the peer actually processed it
+(not only that the bytes left the socket, which says nothing on a half-dead connection).
+
+- To ask, the sender's link adds `"mid": "<id>"` to the header: 1 to 64 characters from
+  `[A-Za-z0-9._-]`, unique among this sender's unacknowledged messages on the connection.
+- The receiver's link, after the addressed feature has handled the message **without error**,
+  sends back:
+
+  ```json
+  {"ch":"link","type":"ack","mid":"<id>"}
+  ```
+
+  with an empty body. A dropped message (malformed envelope, unknown `ch`, feature error, or an
+  invalid `mid`) gets no receipt. A message the feature ignores on purpose (for example a duplicate
+  clip) still counts as handled and gets one.
+- `ch = "link"` messages never carry `mid` and are never acknowledged. Unknown `type` → ignore.
+- A receipt for an unknown `mid` → ignore.
+- Sender (informative): a message counts as **not delivered** if no receipt arrives within 10 s or
+  the connection closes first. Retrying is the feature's (or user's) choice.
+- A receipt covers only the direct peer. When the server relays a message to other clients, the
+  receipt does not mean they received it.
 
 ## 7. Clipboard feature (`ch = "clipboard"`)
 

@@ -19,10 +19,14 @@ import android.widget.Toast
 import com.clipbridge.BridgeService
 import com.clipbridge.MainActivity
 
-/** Quick Settings tile: one tap sends the newest screenshot as an image clip. */
+/**
+ * Quick Settings tile: one tap sends the newest screenshot as an image clip. The tile stays on
+ * ("Sending…") until the PC's delivery receipt arrives, then shows the outcome briefly.
+ * [ImageDelivery] shows the toast, so the outcome is visible even after the shade closes.
+ */
 class SendScreenshotTile : TileService() {
     override fun onStartListening() {
-        qsTile?.apply { state = Tile.STATE_INACTIVE; updateTile() }
+        if (ImageDelivery.listener == null) show(Tile.STATE_INACTIVE, null)
     }
 
     override fun onClick() {
@@ -30,29 +34,31 @@ class SendScreenshotTile : TileService() {
             openApp(); return
         }
         val ctx = applicationContext
+        show(Tile.STATE_ACTIVE, "Sending…")
         Thread {
             val uri = newest("Screenshots") ?: newest(null)
             val png = uri?.let { ImageUtil.readPng(ctx, it) }
             Log.i("ClipBridge", "screenshot tile: found=${uri != null} len=${png?.size}")
-            val ok = png != null && png.isNotEmpty()
-            if (ok) BridgeService.submitImage(ctx, png!!)
-            main.post { feedback(if (ok) "Screenshot sent to PC" else "No screenshot found", ok) }
+            if (png != null && png.isNotEmpty()) {
+                ImageDelivery.listener = { ok -> ImageDelivery.listener = null; settle(if (ok) "Delivered" else "Not delivered") }
+                BridgeService.submitImage(ctx, png)
+            } else main.post {
+                Toast.makeText(ctx, "No screenshot found", Toast.LENGTH_SHORT).show()
+                settle("None found")
+            }
         }.start()
     }
 
     private val main = Handler(Looper.getMainLooper())
 
-    /** Visible confirmation: toast plus a short-lived tile subtitle (toasts can hide behind the shade). */
-    private fun feedback(message: String, ok: Boolean) {
-        Toast.makeText(applicationContext, message, Toast.LENGTH_SHORT).show()
-        qsTile?.apply {
-            state = if (ok) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
-            subtitle = if (ok) "Sent" else "None found"
-            updateTile()
-        }
-        main.postDelayed({
-            qsTile?.apply { state = Tile.STATE_INACTIVE; subtitle = null; updateTile() }
-        }, 2000)
+    /** Final state: subtitle for 2 s (toasts can hide behind the shade), then back to idle. */
+    private fun settle(subtitle: String) {
+        show(Tile.STATE_INACTIVE, subtitle)
+        main.postDelayed({ show(Tile.STATE_INACTIVE, null) }, 2000)
+    }
+
+    private fun show(state: Int, subtitle: String?) {
+        qsTile?.apply { this.state = state; this.subtitle = subtitle; updateTile() }
     }
 
     private fun newest(pathContains: String?): Uri? {

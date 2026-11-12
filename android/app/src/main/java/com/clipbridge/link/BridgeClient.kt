@@ -51,6 +51,7 @@ class BridgeClient(
     private val _status = MutableStateFlow(Status(LinkState.SEARCHING))
     val status: StateFlow<Status> = _status
 
+    private val receipts = Receipts(scope)
     private val wake = Channel<Unit>(Channel.CONFLATED)
     private val sendLock = Any()
     @Volatile private var session: Session? = null
@@ -75,13 +76,16 @@ class BridgeClient(
     /** Network gone: the socket is dead even if TCP has not noticed yet. */
     fun networkLost() { session?.ws?.cancel() }
 
-    override fun send(peer: Peer?, header: JSONObject, body: ByteArray): Boolean {
-        val plaintext = Envelopes.encode(header, body)
-        if (plaintext.size > Envelopes.MAX_PLAINTEXT) { log("skip oversize envelope"); return false }
-        synchronized(sendLock) {
-            val s = session ?: return false
-            return s.sendEncrypted(plaintext)
-        }
+    override fun send(peer: Peer?, header: JSONObject, body: ByteArray, onDelivered: ((Boolean) -> Unit)?): Boolean {
+        // Track before sending: the ack can arrive before sendEncrypted returns.
+        val mid = onDelivered?.let { receipts.track(it) }
+        val h = if (mid == null) header else JSONObject(header.toString()).put("mid", mid)
+        val plaintext = Envelopes.encode(h, body)
+        val sent = if (plaintext.size > Envelopes.MAX_PLAINTEXT) {
+            log("skip oversize envelope"); false
+        } else synchronized(sendLock) { session?.sendEncrypted(plaintext) ?: false }
+        if (!sent && mid != null) receipts.resolve(mid, false)
+        return sent
     }
 
     private suspend fun loop() {
@@ -115,6 +119,7 @@ class BridgeClient(
         s.ws = http.newWebSocket(req, s)
         val authed = s.closed.await()
         synchronized(sendLock) { session = null }
+        receipts.failAll()
         if (authed) {
             router.peerDisconnected(PEER)
             _status.value = Status(LinkState.SEARCHING, "disconnected")
@@ -180,7 +185,11 @@ class BridgeClient(
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
             if (phase != Phase.READY) return fail(4400)
             val plaintext = try { cipher!!.decrypt(bytes.toByteArray()) } catch (e: FrameException) { return fail(4402) }
-            router.dispatch(PEER, plaintext)
+            when (val r = router.dispatch(PEER, plaintext)) {
+                is Routed.Handled -> r.mid?.let { send(PEER, Receipts.ack(it)) }
+                is Routed.LinkControl -> receipts.onControl(r.header)
+                Routed.Dropped -> {}
+            }
         }
 
         private fun fail(code: Int) { ws.close(code, null) }

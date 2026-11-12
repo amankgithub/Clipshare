@@ -47,6 +47,7 @@ The project is really a **general secure device link**; clipboard is just the fi
 7. Decrypted plaintext = envelope: `u32 header_len (BE) ‖ header JSON (UTF-8) ‖ body bytes`.
    Header: `{"ch":"clipboard","type":"clip","kind":"text","data":"…","ts":<ms>}` (text inline in header; binary in body). Unknown `ch`/`type`/`kind` ignored (forward compat). Max frame 16 MiB (room for images); oversize skipped + logged. Chunked streams for big files = future feature, not v1.
 8. Liveness: server ping 10s/timeout 10s; client (OkHttp) ping 15s. Client backoff capped at 10s so PC resume reconnects fast.
+9. Delivery receipts (link service, any feature): sender adds `"mid"` to a header; receiver's link replies `{"ch":"link","type":"ack","mid":…}` once the feature handled it. No receipt within 10s or link lost = not delivered. Used by explicit image sends (screenshot tile, share target) to confirm the PC really got the image.
 
 `test_vectors.json` (fixed PSK/nonces → expected MACs, keys, ciphertexts) is consumed by **both** Python and Kotlin unit tests → guarantees interop.
 

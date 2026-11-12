@@ -9,10 +9,13 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import android.util.Log
+import android.widget.Toast
 import com.clipbridge.BridgeService
 import com.clipbridge.MainActivity
 
@@ -31,8 +34,25 @@ class SendScreenshotTile : TileService() {
             val uri = newest("Screenshots") ?: newest(null)
             val png = uri?.let { ImageUtil.readPng(ctx, it) }
             Log.i("ClipBridge", "screenshot tile: found=${uri != null} len=${png?.size}")
-            if (png != null && png.isNotEmpty()) BridgeService.submitImage(ctx, png)
+            val ok = png != null && png.isNotEmpty()
+            if (ok) BridgeService.submitImage(ctx, png!!)
+            main.post { feedback(if (ok) "Screenshot sent to PC" else "No screenshot found", ok) }
         }.start()
+    }
+
+    private val main = Handler(Looper.getMainLooper())
+
+    /** Visible confirmation: toast plus a short-lived tile subtitle (toasts can hide behind the shade). */
+    private fun feedback(message: String, ok: Boolean) {
+        Toast.makeText(applicationContext, message, Toast.LENGTH_SHORT).show()
+        qsTile?.apply {
+            state = if (ok) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
+            subtitle = if (ok) "Sent" else "None found"
+            updateTile()
+        }
+        main.postDelayed({
+            qsTile?.apply { state = Tile.STATE_INACTIVE; subtitle = null; updateTile() }
+        }, 2000)
     }
 
     private fun newest(pathContains: String?): Uri? {

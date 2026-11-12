@@ -121,8 +121,22 @@ Text clip (v1):
 - Echo/loop suppression is local state (SHA-256 of the text's UTF-8 bytes); see `SyncEngine` in
   `docs/PLAN.md`. Nothing about it is on the wire.
 
-Reserved for later (receivers in v1 ignore it by the unknown-`kind` rule):
-`{"ch":"clipboard","type":"clip","kind":"image","mime":"image/png","ts":...}` with the PNG bytes in `body`.
+Image clip:
+
+```json
+{"ch":"clipboard","type":"clip","kind":"image","mime":"image/png","ts":1700000000000}
+```
+
+- `body`: the image as PNG bytes. `data` is absent. `mime` is always `"image/png"`; senders convert
+  any other source format (JPEG, DIB, WebP, ...) to PNG before sending. Receivers ignore an image
+  clip whose `mime` is not `"image/png"` or whose `body` is empty.
+- If the envelope would exceed the size limit (section 8), the sender skips it and logs.
+- Echo/loop suppression uses SHA-256 of the PNG bytes in the **same** single `last_hash` slot as
+  text (text and images share it; last writer wins).
+- The server relays image clips to all other authenticated clients, like text.
+- Receiver behaviour (informative): Windows puts the image on the clipboard (`PNG` + `CF_DIB`) and
+  saves it to `%USERPROFILE%\Pictures\ClipBridge\`; Android puts a FileProvider `content://` URI on
+  the clipboard.
 
 ## 8. Size limits
 

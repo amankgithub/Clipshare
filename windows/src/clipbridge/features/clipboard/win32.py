@@ -183,8 +183,14 @@ class ClipboardThread(threading.Thread):
             except Exception:
                 log.warning("incoming image conversion failed (len=%d)", len(data))
                 continue
+            self._write(kind, data, dib)
+
+    def _write(self, kind: str, data: str | bytes, dib: bytes) -> bool:
+        """Replace the clipboard contents. Another process (clipboard history, the app that just copied) can
+        disturb the write between EmptyClipboard and SetClipboardData, so the whole write is retried."""
+        for delay in OPEN_RETRY_DELAYS:
             if not self._open():
-                continue
+                return False
             try:
                 win32clipboard.EmptyClipboard()
                 if kind == "image":
@@ -192,10 +198,14 @@ class ClipboardThread(threading.Thread):
                     win32clipboard.SetClipboardData(win32con.CF_DIB, dib)
                 else:
                     win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, data)
-            except pywintypes.error:
-                log.exception("set clipboard failed")
+                return True
+            except pywintypes.error as exc:
+                error = exc
             finally:
                 win32clipboard.CloseClipboard()
+            time.sleep(delay)
+        log.warning("set clipboard failed after retries: %s", error.strerror)
+        return False
 
 
 def dib_to_png(dib: bytes) -> bytes:

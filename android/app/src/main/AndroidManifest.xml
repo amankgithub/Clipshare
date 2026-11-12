@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <application
+        android:label="ClipBridge"
+        android:usesCleartextTraffic="true">
+
+        <activity android:name=".MainActivity" android:exported="true"
+            android:theme="@android:style/Theme.DeviceDefault.DayNight">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Only `adb shell` holds DUMP, so only adb can call this. -->
+        <activity android:name=".ui.PairActivity" android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:theme="@style/Transparent" android:excludeFromRecents="true" />
+
+        <activity android:name=".features.clipboard.ClipReadActivity" android:exported="false"
+            android:theme="@style/Transparent" android:excludeFromRecents="true"
+            android:taskAffinity="" android:launchMode="singleInstance" android:noHistory="true" />
+
+        <activity android:name=".features.clipboard.ShareTargetActivity" android:exported="true"
+            android:theme="@style/Transparent" android:excludeFromRecents="true"
+            android:taskAffinity="" android:label="Send to PC">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
+        <service android:name=".features.clipboard.SendClipboardTile" android:exported="true"
+            android:label="Send clipboard" android:icon="@drawable/ic_tile"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <service android:name=".BridgeService" android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <receiver android:name=".BootReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

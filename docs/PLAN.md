@@ -54,7 +54,7 @@ The project is really a **general secure device link**; clipboard is just the fi
 10. File transfer (link service, any feature; PROTOCOL.md 6.2): offer / accept-with-ranges / done on the control connection; bytes on separate **data connections** (subprotocol `clipbridge.data.v1`, same handshake), always dialed by the phone, so a 2 GB file never delays a clip. Resume = receiver reports how many bytes of each range it already has (tus idea); each range ends with its SHA-256 and the receiver renames `.part` to the final name only after every hash matches (Syncthing idea). One data connection carries many files back to back (LocalSend session idea).
 
 ### File transfer design
-- **Queue**: sender keeps an in-memory FIFO of files (id → path/URI). Unfinished items are re-offered with the same `id` after a reconnect. Up to `STREAMS` data connections at once; separate files run in parallel and one large file is split into up to `STREAMS` ranges written at their offsets into a preallocated `.part` (aria2/IDM segmented download). `STREAMS` starts at 1 and is raised only if the benchmark shows a gain (one TCP stream usually fills a LAN).
+- **Queue**: sender keeps an in-memory FIFO of files (id → path/URI). Unfinished items are re-offered with the same `id` after a reconnect. Up to `STREAMS` data connections at once per direction (sending never waits behind a large file being received); separate files run in parallel and one large file is split into up to `STREAMS` ranges written at their offsets into a preallocated `.part` (aria2/IDM segmented download). `STREAMS` is 1: on the vivo over 5 GHz, three raw TCP streams together were slower than one (13.6 vs 16.1 MB/s), so the range-splitting path stays unused unless a future benchmark shows a gain.
 - **Speed**, in order of value: phone holds a `WIFI_MODE_FULL_LOW_LATENCY` Wi-Fi lock + partial wakelock while transferring (Wi-Fi power-save is the main throughput killer); hashing happens while streaming, never as a pre-pass; disk reads run ahead on a thread (2 × 4 MiB chunks) so the socket never waits on disk; 4 MiB frames and large socket buffers. No compression (media is already compressed). Transfer logs print MB/s.
 - **Partial files**: Windows keeps `<name>.part` plus a small state file under `%LOCALAPPDATA%\ClipBridge\partial\` and drops entries older than 24 h; Android keeps a MediaStore row with `IS_PENDING=1` and its range state in app-private storage.
 
@@ -63,7 +63,7 @@ The project is really a **general secure device link**; clipboard is just the fi
 - PC receives into `%USERPROFILE%\Downloads\ClipShare\` (name clash → ` (1)`, ` (2)`, …); tray balloon "Received <name>", click opens Explorer with the file selected.
 - PC sends from Explorer: classic context menu verb "Send to phone" (`HKCU\Software\Classes\*\shell\ClipBridge`, `MultiSelectModel=Player`) and a `shell:sendto` shortcut. Both run `pythonw -m clipbridge send <file>`, which hands the path to the running server over named pipe `\\.\pipe\ClipBridge` and exits; each Explorer-spawned process adds one file to the queue. Files only, not folders.
 - Phone receives automatically into `Downloads/ClipShare` via MediaStore; progress notification, then tap to open plus a Share action. Runs inside `BridgeService`, so screen lock does not stop it.
-- Phone sends from the share sheet: `ShareTargetActivity` takes `*/*` and `ACTION_SEND_MULTIPLE`; images keep going through the clipboard image path, every other file goes through `send_file`. Same "Sending…" toast, then the delivered/failed result.
+- Phone sends from the share sheet: `ShareTargetActivity` takes `*/*` and `ACTION_SEND_MULTIPLE`; a share of exactly one image (that fits a clip) goes through the clipboard image path; anything else — several items, any non-image — goes through `send_file` as the original files, so one share never splits between the clipboard and `Downloads\ClipShare`. Same "Sending…" toast, then the delivered/failed result.
 
 `test_vectors.json` (fixed PSK/nonces → expected MACs, keys, ciphertexts) is consumed by **both** Python and Kotlin unit tests → guarantees interop.
 
@@ -135,6 +135,13 @@ Code layout follows the layers on both sides: `link/` (transport, crypto, discov
 | Phone copy via QS tile/share | ~same as tap + 50 ms | — | user tap |
 | Reconnect after Wi-Fi drop / PC wake | 1–3 s | ~10 s | DHCP + backoff cap |
 Crypto/JSON cost <1 ms. Spike (Phase 0) measures the real phone→PC number.
+
+File transfer, measured on the vivo V2502 with a 1 GiB random file (step 10):
+| Link | Raw TCP ceiling PC→phone / phone→PC | ClipBridge PC→phone | ClipBridge phone→PC |
+|---|---|---|---|
+| 2.4 GHz via range extender | 2.7 / 2.3 MB/s | 2.4 MB/s | — |
+| 5 GHz, main router (433 Mb/s link) | 15.1 / 14.4 MB/s | 14.5 MB/s idle phone; 3.6–5.8 MB/s while the phone is in use | 5.0 MB/s |
+On the extender, Wi-Fi stalls of 10–20 s drop the link; the transfer reconnects and resumes from the last checkpoint (≤ 32 MiB re-sent).
 
 ## Keeping sessions small (usage limits)
 - Repo carries its own context so fresh sessions start cheap: short `CLAUDE.md` (layout, commands, conventions, ≤40 lines) + `protocol/PROTOCOL.md`. No session needs this chat.

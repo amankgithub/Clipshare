@@ -1,4 +1,4 @@
-"""Wiring: logging, single-instance mutex, link + discovery + clipboard feature on one asyncio loop."""
+"""Wiring: logging, single-instance mutex, link + discovery + features on one asyncio loop."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ import winerror
 from clipbridge import config
 from clipbridge.features.clipboard.feature import ClipboardFeature
 from clipbridge.features.clipboard.win32 import ClipboardThread
+from clipbridge.features.files.balloon import BalloonThread
+from clipbridge.features.files.feature import FilesFeature
 from clipbridge.link.discovery import Advertiser
 from clipbridge.link.server import DEFAULT_PORT, Link
 
@@ -59,7 +61,7 @@ def is_running() -> bool:
 async def _run(port: int) -> None:
     loop = asyncio.get_running_loop()
     psk = config.get_or_create_psk()
-    link = Link(psk, port=port)
+    link = Link(psk, config.partial_dir(), port=port)
     advertiser = Advertiser(port)
 
     clip_thread: ClipboardThread
@@ -76,7 +78,9 @@ async def _run(port: int) -> None:
     clip_thread = ClipboardThread(
         on_text, lambda: loop.call_soon_threadsafe(advertiser.request_refresh), on_image
     )
+    balloon = BalloonThread()
     link.register(feature)
+    link.register(FilesFeature(link, notify=balloon.show))
 
     await link.start()
     try:
@@ -84,12 +88,14 @@ async def _run(port: int) -> None:
     except Exception:
         log.exception("mDNS start failed; the 30 s watcher will retry")
     clip_thread.start_and_wait()
+    balloon.start_and_wait()
     watcher = asyncio.create_task(advertiser.watch())
     try:
         await asyncio.Event().wait()
     finally:
         watcher.cancel()
         clip_thread.stop()
+        balloon.stop()
         await advertiser.stop()
         await link.stop()
 

@@ -21,8 +21,8 @@ def clip(text: str) -> dict:
 
 
 @pytest.fixture
-async def env() -> AsyncIterator[tuple[Link, list[str]]]:
-    link = Link(PSK, host="127.0.0.1", port=0)
+async def env(tmp_path) -> AsyncIterator[tuple[Link, list[str]]]:
+    link = Link(PSK, tmp_path / "partial", host="127.0.0.1", port=0)
     written: list[str] = []
     link.register(ClipboardFeature(link, written.append))
     await link.start()
@@ -146,7 +146,7 @@ def image_clip() -> dict:
 
 
 async def test_image_relay_between_clients(tmp_path) -> None:
-    link = Link(PSK, host="127.0.0.1", port=0)
+    link = Link(PSK, tmp_path / "partial", host="127.0.0.1", port=0)
     images: list[bytes] = []
     link.register(ClipboardFeature(link, lambda t: None, images.append, save_dir=tmp_path))
     await link.start()

@@ -1,0 +1,406 @@
+"""File transfer end to end over loopback, with `tclient.TestClient` playing the phone."""
+
+import asyncio
+import hashlib
+import logging
+import os
+import time
+from pathlib import Path
+from typing import AsyncIterator
+
+import pytest
+from websockets.exceptions import ConnectionClosed
+
+from clipbridge.features.clipboard.feature import ClipboardFeature
+from clipbridge.features.files.feature import FilesFeature, unique_path
+from clipbridge.link.server import Link
+from clipbridge.link.transfer_core import CHUNK
+from tclient import TestClient
+
+PSK = bytes(range(32))
+DATA = "clipbridge.data.v1"
+log = logging.getLogger(__name__)
+
+
+class Env:
+    def __init__(self, tmp: Path) -> None:
+        self.partial = tmp / "partial"
+        self.dest = tmp / "ClipShare"
+        self.clips: list[str] = []
+        self.received: list[Path] = []
+        self.link = self.make_link()
+
+    def make_link(self) -> Link:
+        link = Link(PSK, self.partial, host="127.0.0.1", port=0)
+        link.register(ClipboardFeature(link, self.clips.append))
+        self.files = FilesFeature(link, dest_dir=self.dest, notify=self.received.append)
+        link.register(self.files)
+        return link
+
+    async def phone(self, device: str = "phone") -> TestClient:
+        return await TestClient.connect(self.link.port, PSK, device)
+
+    async def data(self, device: str = "phone") -> TestClient:
+        return await TestClient.connect(self.link.port, PSK, device, DATA)
+
+
+@pytest.fixture
+async def env(tmp_path: Path) -> AsyncIterator[Env]:
+    e = Env(tmp_path)
+    await e.link.start()
+    yield e
+    await e.link.stop()
+
+
+def fid(n: int = 1) -> str:
+    return f"{n:032x}"
+
+
+def offer(id_: str, name: str, size: int) -> dict:
+    return {"ch": "link", "type": "xfer_offer", "id": id_, "feature": "files", "name": name, "size": size, "meta": {}}
+
+
+async def recv(c: TestClient, timeout: float = 10) -> dict:
+    header, _ = await asyncio.wait_for(c.recv(), timeout)
+    return header
+
+
+async def stream(d: TestClient, data: bytes, chunk: int = 64 * 1024) -> None:
+    for i in range(0, len(data), chunk):
+        await d.send({"ch": "link", "type": "xfer_data"}, data[i : i + chunk])
+
+
+async def closed_code(c: TestClient) -> int:
+    with pytest.raises(ConnectionClosed):
+        while True:
+            await asyncio.wait_for(c.ws.recv(), 5)
+    return c.ws.protocol.close_rcvd.code
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+# -- phone -> PC ---------------------------------------------------------------
+
+
+async def test_receive_new_file(env: Env) -> None:
+    body = os.urandom(300_000)
+    phone = await env.phone()
+    await phone.send(offer(fid(), "photo.jpg", len(body)))
+    accept = await recv(phone)
+    assert accept == {"ch": "link", "type": "xfer_accept", "id": fid(), "ranges": [[0, len(body), 0]]}
+    d = await env.data()
+    await d.send({"ch": "link", "type": "xfer_attach", "id": fid(), "start": 0})
+    await stream(d, body)
+    await d.send({"ch": "link", "type": "xfer_end", "sha256": sha(body)})
+    assert await recv(phone) == {"ch": "link", "type": "xfer_done", "id": fid(), "ok": True}
+    target = env.dest / "photo.jpg"
+    assert target.read_bytes() == body
+    assert env.received == [target]
+    assert list(env.partial.iterdir()) == []
+
+
+async def test_resume_from_have_after_reconnect(env: Env) -> None:
+    body = os.urandom(1_000_000)
+    phone = await env.phone()
+    await phone.send(offer(fid(), "big.bin", len(body)))
+    await recv(phone)
+    d = await env.data()
+    await d.send({"ch": "link", "type": "xfer_attach", "id": fid(), "start": 0})
+    await stream(d, body[:600_000])
+    await asyncio.sleep(0.3)
+    await phone.ws.close()  # control lost: server closes the data connection too
+    assert await closed_code(d) == 1000
+
+    phone = await env.phone()
+    await phone.send(offer(fid(), "big.bin", len(body)))
+    accept = await recv(phone)
+    [[start, end, have]] = accept["ranges"]
+    assert (start, end) == (0, len(body)) and 0 < have <= 600_000
+    d = await env.data()
+    await d.send({"ch": "link", "type": "xfer_attach", "id": fid(), "start": 0})
+    await stream(d, body[have:])
+    await d.send({"ch": "link", "type": "xfer_end", "sha256": sha(body)})
+    assert (await recv(phone))["ok"] is True
+    assert (env.dest / "big.bin").read_bytes() == body
+
+
+async def test_resume_after_server_restart(env: Env) -> None:
+    body = os.urandom(500_000)
+    phone = await env.phone()
+    await phone.send(offer(fid(), "r.bin", len(body)))
+    await recv(phone)
+    d = await env.data()
+    await d.send({"ch": "link", "type": "xfer_attach", "id": fid(), "start": 0})
+    await stream(d, body[:200_000])
+    await asyncio.sleep(0.3)
+    await env.link.stop()
+    env.link = env.make_link()  # fresh process state; only the partial directory survives
+    await env.link.start()
+
+    phone = await env.phone()
+    await phone.send(offer(fid(), "r.bin", len(body)))
+    [[_, _, have]] = (await recv(phone))["ranges"]
+    assert have == 200_000
+    d = await env.data()
+    await d.send({"ch": "link", "type": "xfer_attach", "id": fid(), "start": 0})
+    await stream(d, body[have:])
+    await d.send({"ch": "link", "type": "xfer_end", "sha256": sha(body)})
+    assert (await recv(phone))["ok"] is True
+    assert (env.dest / "r.bin").read_bytes() == body
+
+
+async def test_hash_mismatch_reports_failure_and_discards(env: Env) -> None:
+    body = os.urandom(10_000)
+    phone = await env.phone()
+    await phone.send(offer(fid(), "x.bin", len(body)))
+    await recv(phone)
+    d = await env.data()
+    await d.send({"ch": "link", "type": "xfer_attach", "id": fid(), "start": 0})
+    await stream(d, body)
+    await d.send({"ch": "link", "type": "xfer_end", "sha256": sha(b"other")})
+    assert await recv(phone) == {"ch": "link", "type": "xfer_done", "id": fid(), "ok": False}
+    assert not (env.dest / "x.bin").exists()
+    assert list(env.partial.iterdir()) == []
+    # a fresh offer under a new id starts from zero
+    await phone.send(offer(fid(2), "x.bin", len(body)))
+    assert (await recv(phone))["ranges"] == [[0, len(body), 0]]
+
+
+async def test_name_clash_gets_suffix(env: Env) -> None:
+    env.dest.mkdir(parents=True)
+    (env.dest / "a.txt").write_bytes(b"old")
+    (env.dest / "a (1).txt").write_bytes(b"old")
+    phone = await env.phone()
+    await phone.send(offer(fid(), "a.txt", 3))
+    await recv(phone)
+    d = await env.data()
+    await d.send({"ch": "link", "type": "xfer_attach", "id": fid(), "start": 0})
+    await d.send({"ch": "link", "type": "xfer_data"}, b"new")
+    await d.send({"ch": "link", "type": "xfer_end", "sha256": sha(b"new")})
+    assert (await recv(phone))["ok"] is True
+    assert (env.dest / "a (2).txt").read_bytes() == b"new"
+    assert (env.dest / "a.txt").read_bytes() == b"old"
+
+
+def test_unique_path(tmp_path: Path) -> None:
+    assert unique_path(tmp_path, "n.tar.gz") == tmp_path / "n.tar.gz"
+    (tmp_path / "n.tar.gz").write_bytes(b"")
+    assert unique_path(tmp_path, "n.tar.gz") == tmp_path / "n.tar (1).gz"
+    (tmp_path / "noext").write_bytes(b"")
+    assert unique_path(tmp_path, "noext") == tmp_path / "noext (1)"
+
+
+async def test_empty_file(env: Env) -> None:
+    phone = await env.phone()
+    await phone.send(offer(fid(), "empty.txt", 0))
+    assert (await recv(phone))["ranges"] == []
+    assert await recv(phone) == {"ch": "link", "type": "xfer_done", "id": fid(), "ok": True}
+    assert (env.dest / "empty.txt").read_bytes() == b""
+    assert env.received == [env.dest / "empty.txt"]
+
+
+async def test_unknown_feature_rejected(env: Env) -> None:
+    phone = await env.phone()
+    await phone.send({**offer(fid(), "a", 1), "feature": "nope"})
+    assert await recv(phone) == {"ch": "link", "type": "xfer_reject", "id": fid()}
+
+
+async def test_attach_unknown_id_4404(env: Env) -> None:
+    d = await env.data()
+    await d.send({"ch": "link", "type": "xfer_attach", "id": fid(9), "start": 0})
+    assert await closed_code(d) == 4404
+
+
+async def test_attach_unknown_start_4404(env: Env) -> None:
+    phone = await env.phone()
+    await phone.send(offer(fid(), "a", 10))
+    await recv(phone)
+    d = await env.data()
+    await d.send({"ch": "link", "type": "xfer_attach", "id": fid(), "start": 5})
+    assert await closed_code(d) == 4404
+
+
+async def test_bytes_past_end_4400(env: Env) -> None:
+    phone = await env.phone()
+    await phone.send(offer(fid(), "a", 10))
+    await recv(phone)
+    d = await env.data()
+    await d.send({"ch": "link", "type": "xfer_attach", "id": fid(), "start": 0})
+    await d.send({"ch": "link", "type": "xfer_data"}, b"x" * 11)
+    assert await closed_code(d) == 4400
+
+
+async def test_data_connection_is_not_a_peer(env: Env) -> None:
+    phone = await env.phone()
+    await env.data()
+    await asyncio.sleep(0.1)
+    assert [p.device for p in env.link.peers] == ["phone"]
+    await phone.send({"ch": "clipboard", "type": "clip", "kind": "text", "data": "still here", "ts": 1})
+    await asyncio.sleep(0.1)
+    assert env.clips == ["still here"]  # no 4409 for the control connection
+
+
+async def test_cancel_by_sender_deletes_partial(env: Env) -> None:
+    phone = await env.phone()
+    await phone.send(offer(fid(), "c.bin", 100))
+    await recv(phone)
+    assert any(env.partial.iterdir())
+    await phone.send({"ch": "link", "type": "xfer_cancel", "id": fid()})
+    await asyncio.sleep(0.2)
+    assert list(env.partial.iterdir()) == []
+
+
+# -- PC -> phone ---------------------------------------------------------------
+
+
+async def phone_receive(env: Env, phone: TestClient, *, have: int = 0, ok: bool = True) -> tuple[str, bytes]:
+    """Play the receiving phone for one offer: accept, attach, collect, check, report done."""
+    o = await recv(phone)
+    assert o["type"] == "xfer_offer" and o["feature"] == "files"
+    await phone.send({"ch": "link", "type": "xfer_accept", "id": o["id"], "ranges": [[0, o["size"], have]] if o["size"] else []})
+    if o["size"] == 0:
+        await phone.send({"ch": "link", "type": "xfer_done", "id": o["id"], "ok": ok})
+        return o["id"], b""
+    d = await env.data()
+    await d.send({"ch": "link", "type": "xfer_attach", "id": o["id"], "start": 0})
+    parts: list[bytes] = []
+    while True:
+        header, body = await asyncio.wait_for(d.recv(), 30)
+        if header["type"] == "xfer_end":
+            break
+        assert header["type"] == "xfer_data" and 1 <= len(body) <= CHUNK
+        parts.append(body)
+    got = b"".join(parts)
+    assert len(got) == o["size"] - have
+    await phone.send({"ch": "link", "type": "xfer_done", "id": o["id"], "ok": ok})
+    return header["sha256"], got
+
+
+async def test_send_file_to_phone(env: Env, tmp_path: Path) -> None:
+    src = tmp_path / "doc.pdf"
+    src.write_bytes(os.urandom(9 * 1024 * 1024 + 7))  # spans several 4 MiB frames
+    phone = await env.phone()
+    result = asyncio.ensure_future(env.files.send(src))
+    digest, got = await phone_receive(env, phone)
+    assert got == src.read_bytes() and digest == sha(got)
+    assert await asyncio.wait_for(result, 5) is True
+
+
+async def test_send_file_resumes_with_have_and_retries_once(env: Env, tmp_path: Path) -> None:
+    src = tmp_path / "v.bin"
+    data = os.urandom(100_000)
+    src.write_bytes(data)
+    phone = await env.phone()
+    result = asyncio.ensure_future(env.files.send(src))
+    digest, got = await phone_receive(env, phone, have=40_000, ok=False)
+    assert got == data[40_000:] and digest == sha(data)  # hash covers the have prefix
+    digest, got = await phone_receive(env, phone, ok=True)  # retry under a new id
+    assert got == data
+    assert await asyncio.wait_for(result, 5) is True
+
+
+async def test_send_file_reoffered_after_reconnect(env: Env, tmp_path: Path) -> None:
+    src = tmp_path / "q.bin"
+    src.write_bytes(b"q" * 1000)
+    phone = await env.phone()
+    result = asyncio.ensure_future(env.files.send(src))
+    first = await recv(phone)
+    await phone.ws.close()
+    phone = await env.phone()
+    again = await recv(phone)
+    assert again["id"] == first["id"]
+    await phone.send({"ch": "link", "type": "xfer_reject", "id": again["id"]})
+    assert await asyncio.wait_for(result, 5) is False
+
+
+async def test_send_empty_file(env: Env, tmp_path: Path) -> None:
+    src = tmp_path / "e.txt"
+    src.write_bytes(b"")
+    phone = await env.phone()
+    result = asyncio.ensure_future(env.files.send(src))
+    await phone_receive(env, phone)
+    assert await asyncio.wait_for(result, 5) is True
+
+
+# -- throughput with the clipboard still flowing --------------------------------
+
+
+async def clip_round_trips(phone: TestClient, stop: asyncio.Event) -> list[float]:
+    """Send clips with receipts until stopped; return each round-trip time."""
+    rtts: list[float] = []
+    n = 0
+    while not stop.is_set():
+        n += 1
+        t0 = time.monotonic()
+        await phone.send({"ch": "clipboard", "type": "clip", "kind": "text", "data": f"clip {n}", "ts": 1, "mid": f"m{n}"})
+        while True:
+            header, _ = await asyncio.wait_for(phone.recv(), 5)
+            if header.get("mid") == f"m{n}":
+                break
+        rtts.append(time.monotonic() - t0)
+        await asyncio.sleep(0.05)
+    return rtts
+
+
+async def test_200mb_receive_while_clipboard_flows(env: Env) -> None:
+    size = 200 * 1024 * 1024
+    block = os.urandom(CHUNK)
+    whole = hashlib.sha256()
+    for _ in range(size // CHUNK):
+        whole.update(block)
+    phone = await env.phone()
+    await phone.send(offer(fid(), "big.bin", size))
+    await recv(phone)
+    stop = asyncio.Event()
+    clips = asyncio.ensure_future(clip_round_trips(phone, stop))
+    d = await env.data()
+    t0 = time.monotonic()
+    await d.send({"ch": "link", "type": "xfer_attach", "id": fid(), "start": 0})
+    for _ in range(size // CHUNK):
+        await d.send({"ch": "link", "type": "xfer_data"}, block)
+    await d.send({"ch": "link", "type": "xfer_end", "sha256": whole.hexdigest()})
+    while not clips.done():
+        await asyncio.sleep(0.01)
+        if (env.dest / "big.bin").exists():
+            break
+    elapsed = time.monotonic() - t0
+    stop.set()
+    rtts = await clips
+    print(f"\n200 MB phone->PC: {size / 1e6 / elapsed:.1f} MB/s; {len(rtts)} clips, max rtt {max(rtts) * 1000:.0f} ms")
+    assert (env.dest / "big.bin").stat().st_size == size
+    assert len(rtts) >= 3 and max(rtts) < 1.0
+    assert env.clips[-1] == f"clip {len(rtts)}"
+
+
+async def test_200mb_send_while_clipboard_flows(env: Env, tmp_path: Path) -> None:
+    src = tmp_path / "big.bin"
+    block = os.urandom(1024 * 1024)
+    with open(src, "wb") as f:
+        for _ in range(200):
+            f.write(block)
+    phone = await env.phone()
+    stop = asyncio.Event()
+    result = asyncio.ensure_future(env.files.send(src))
+    o = await recv(phone)
+    clips = asyncio.ensure_future(clip_round_trips(phone, stop))
+    await phone.send({"ch": "link", "type": "xfer_accept", "id": o["id"], "ranges": [[0, o["size"], 0]]})
+    d = await env.data()
+    t0 = time.monotonic()
+    await d.send({"ch": "link", "type": "xfer_attach", "id": o["id"], "start": 0})
+    h, n = hashlib.sha256(), 0
+    while True:
+        header, body = await asyncio.wait_for(d.recv(), 30)
+        if header["type"] == "xfer_end":
+            break
+        h.update(body)
+        n += len(body)
+    elapsed = time.monotonic() - t0
+    stop.set()
+    rtts = await clips
+    assert n == o["size"] and header["sha256"] == h.hexdigest()
+    await phone.send({"ch": "link", "type": "xfer_done", "id": o["id"], "ok": True})
+    assert await asyncio.wait_for(result, 5) is True
+    print(f"\n200 MB PC->phone: {n / 1e6 / elapsed:.1f} MB/s; {len(rtts)} clips, max rtt {max(rtts) * 1000:.0f} ms")
+    assert len(rtts) >= 3 and max(rtts) < 1.0

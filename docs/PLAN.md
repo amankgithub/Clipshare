@@ -150,8 +150,8 @@ Crypto/JSON cost <1 ms. Spike (Phase 0) measures the real phone→PC number.
 4. Persistence: Task Scheduler + firewall install; boot receiver; setup script.
 5. End-to-end + soak.
 6. File transfer spec: `PROTOCOL.md` 6.2, this plan, `CLAUDE.md`, `docs/FOOTPRINT.md`.
-7. Windows: `link/transfer.py` (pure range/resume logic + data-connection I/O), `clipbridge.data.v1` in `link/server.py`, `features/files/`; tests drive it with `tests/tclient.py` acting as the phone.
-8. Windows shell: `clipbridge send` + named pipe, context-menu verb, SendTo shortcut, tray balloon, `uninstall --purge`.
+7. Windows: `link/transfer_core.py` (pure range/resume logic) + `link/transfer.py` (data-connection and disk I/O), `clipbridge.data.v1` in `link/server.py`, `features/files/` (destination, name clash, tray balloon); tests drive it with `tests/tclient.py` acting as the phone.
+8. Windows shell: `clipbridge send` + named pipe, context-menu verb, SendTo shortcut, `uninstall --purge`.
 9. Android: `link/Transfer.kt` (data connections over OkHttp, Wi-Fi lock), `features/files/`, share target for any file. Independent of 7–8 (works from the spec) → can run in parallel.
 10. File transfer end to end on the vivo + speed benchmark (`STREAMS` 1 vs 3 against a raw-socket ceiling).
 

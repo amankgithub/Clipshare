@@ -20,8 +20,14 @@ class TestClient:
         self.channel = channel
 
     @classmethod
-    async def connect(cls, port: int, psk: bytes, device: str = "dev-1") -> "TestClient":
-        ws = await connect(f"ws://127.0.0.1:{port}/", subprotocols=["clipbridge.v1"])  # type: ignore[list-item]
+    async def connect(
+        cls, port: int, psk: bytes, device: str = "dev-1", subprotocol: str = "clipbridge.v1"
+    ) -> "TestClient":
+        """Control connection by default; pass subprotocol="clipbridge.data.v1" for a data connection."""
+        ws = await connect(
+            f"ws://127.0.0.1:{port}/", subprotocols=[subprotocol], max_size=None, compression=None  # type: ignore[list-item]
+        )
+        assert ws.subprotocol == subprotocol
         challenge = json.loads(await ws.recv())
         sn = b64d(challenge["sn"], 16)
         cn = os.urandom(16)

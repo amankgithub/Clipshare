@@ -20,6 +20,11 @@ def log_dir() -> Path:
     return Path(os.environ["LOCALAPPDATA"]) / "ClipBridge" / "logs"
 
 
+def partial_dir() -> Path:
+    """Unfinished incoming file transfers (`.part` + state)."""
+    return Path(os.environ["LOCALAPPDATA"]) / "ClipBridge" / "partial"
+
+
 def _config_path() -> Path:
     return config_dir() / "config.json"
 

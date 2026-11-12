@@ -79,7 +79,7 @@ Deps: `websockets`, `zeroconf`, `pywin32`, `cryptography`. Dev: `pytest`, `pytes
 ```
 windows/pyproject.toml
 windows/src/clipbridge/
-  __main__.py     CLI: run | pair | install | uninstall | status
+  __main__.py     CLI: run | pair | send | install | uninstall [--purge] | status
   config.py       %APPDATA%\ClipBridge\config.json; PSK stored DPAPI-encrypted (win32crypt)
   protocol.py     message dataclasses, encode/decode, size limits
   crypto.py       handshake MACs, HKDF, SecureChannel(encrypt/decrypt, counters)

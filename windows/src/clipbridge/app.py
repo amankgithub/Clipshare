@@ -6,6 +6,7 @@ import asyncio
 import logging
 import logging.handlers
 import sys
+from pathlib import Path
 
 import pywintypes
 import win32api
@@ -17,6 +18,7 @@ from clipbridge.features.clipboard.feature import ClipboardFeature
 from clipbridge.features.clipboard.win32 import ClipboardThread
 from clipbridge.features.files.balloon import BalloonThread
 from clipbridge.features.files.feature import FilesFeature
+from clipbridge.features.files.pipe import PipeServer
 from clipbridge.link.discovery import Advertiser
 from clipbridge.link.server import DEFAULT_PORT, Link
 
@@ -79,8 +81,19 @@ async def _run(port: int) -> None:
         on_text, lambda: loop.call_soon_threadsafe(advertiser.request_refresh), on_image
     )
     balloon = BalloonThread()
+    files = FilesFeature(link, notify=balloon.show)
     link.register(feature)
-    link.register(FilesFeature(link, notify=balloon.show))
+    link.register(files)
+
+    def on_send_request(paths: list[Path]) -> None:
+        for path in paths:
+            asyncio.run_coroutine_threadsafe(files.send(path), loop)
+
+    pipe_server: PipeServer | None = None
+    try:
+        pipe_server = PipeServer(on_send_request)
+    except pywintypes.error:
+        log.exception("send pipe unavailable; Explorer 'Send to phone' will not work")
 
     await link.start()
     try:
@@ -89,11 +102,15 @@ async def _run(port: int) -> None:
         log.exception("mDNS start failed; the 30 s watcher will retry")
     clip_thread.start_and_wait()
     balloon.start_and_wait()
+    if pipe_server is not None:
+        pipe_server.start()
     watcher = asyncio.create_task(advertiser.watch())
     try:
         await asyncio.Event().wait()
     finally:
         watcher.cancel()
+        if pipe_server is not None:
+            pipe_server.stop()
         clip_thread.stop()
         balloon.stop()
         await advertiser.stop()

@@ -1,4 +1,4 @@
-"""CLI: run | pair | install | uninstall | status."""
+"""CLI: run | pair | send | install | uninstall | status."""
 
 from __future__ import annotations
 
@@ -53,18 +53,47 @@ def pair() -> int:
     return 0
 
 
+def _report(text: str) -> None:
+    """Print, or show a message box when started by pythonw (Explorer) without a console."""
+    if sys.stdout is not None:
+        print(text)
+        return
+    import win32api
+    import win32con
+
+    win32api.MessageBox(0, text, "ClipBridge", win32con.MB_OK | win32con.MB_ICONWARNING)
+
+
+def send(args: list[str]) -> int:
+    from clipbridge.features.files import pipe
+
+    files, errors = pipe.validate_paths(args, Path.cwd())
+    if files:
+        try:
+            pipe.send_request(files)
+        except pipe.ServerNotRunning:
+            errors.append("ClipBridge is not running, so nothing was sent. Start it (task 'ClipBridge') and try again.")
+            files = []
+    if errors:
+        _report("\n".join(errors))
+    return 0 if files and len(files) == len(args) else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="clipbridge")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name, text in [
-        ("run", "run the server"),
-        ("pair", "push the key to the phone via adb and print it"),
-        ("install", "register Task Scheduler task + firewall rule (UAC prompt)"),
-        ("uninstall", "remove task and firewall rule (UAC prompt)"),
-        ("status", "show running/installed state"),
-    ]:
-        sub.add_parser(name, help=text)
-    command = parser.parse_args(argv).command
+    sub.add_parser("run", help="run the server")
+    sub.add_parser("pair", help="push the key to the phone via adb and print it")
+    send_parser = sub.add_parser("send", help="send files to the phone through the running server")
+    send_parser.add_argument("files", nargs="+")
+    sub.add_parser("install", help="register task, firewall rule (UAC prompt), Explorer 'Send to phone'")
+    uninstall_parser = sub.add_parser("uninstall", help="remove everything install added (UAC prompt)")
+    uninstall_parser.add_argument(
+        "--purge", action="store_true", help="also delete config, key, logs and unfinished transfers"
+    )
+    sub.add_parser("status", help="show running/installed state")
+    args = parser.parse_args(argv)
+    command = args.command
 
     if command == "run":
         from clipbridge import app
@@ -72,10 +101,13 @@ def main(argv: list[str] | None = None) -> int:
         return app.run()
     if command == "pair":
         return pair()
+    if command == "send":
+        return send(args.files)
     from clipbridge import install
 
-    return {"install": install.install, "uninstall": install.uninstall, "status": install.status}[command]()
-
+    if command == "uninstall":
+        return install.uninstall(purge=args.purge)
+    return {"install": install.install, "status": install.status}[command]()
 
 if __name__ == "__main__":
     sys.exit(main())

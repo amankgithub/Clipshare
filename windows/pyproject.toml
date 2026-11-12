@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clipbridge"
+version = "0.1.0"
+description = "ClipBridge Windows server: LAN-only secure link to Android, clipboard sync on top"
+requires-python = ">=3.10"
+dependencies = [
+    "websockets>=14",
+    "zeroconf>=0.130",
+    "pywin32>=306",
+    "cryptography>=42",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

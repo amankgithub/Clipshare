@@ -127,6 +127,44 @@ Setup script `android/setup.ps1`: build+install APK, `pm grant READ_LOGS`, `appo
 
 Code layout follows the layers on both sides: `link/` (transport, crypto, discovery, peers, receipts, transfer) and one package per feature: `features/clipboard/` (SyncEngine, platform clipboard I/O), `features/files/` (destination, notifications, send entry points). Python: `link/` + `features/` subpackages under `clipbridge/`; Kotlin: `com.clipbridge.link.*` + `com.clipbridge.features.<name>.*`. File transfer splits pure range/resume logic (unit-tested) from the socket and disk I/O.
 
+## Target layering (before the next features)
+`link/` today holds transport, crypto, routing, receipts and file transfer, and OS glue sits inside features (the Windows clipboard thread and tray balloon, the named pipe, `ShareTargetActivity` routing to two features). The next features (hotspot, input sharing, second display, phone mirroring) reuse each other's parts, so both sides move to five layers with the same names:
+
+| Layer | Holds | Rule |
+|---|---|---|
+| `link/` | bearers (WebSocket now; USB via `adb reverse`, laptop hotspot and Bluetooth next), secure channel, routing. Services: `hello` (features + versions + device info), request/response (receipts are its empty-reply case, usable by both sides), streams (generic data connections: bulk-resumable, realtime, media), file transfer built on streams, device registry (names, per-device keys) | knows no feature names |
+| `platform/` | OS services behind small interfaces: clipboard access (read, write, change events, privacy flags), notifications and tray, settings, storage destinations (Mark-of-the-Web on Windows), power locks, network and hotspot control, input capture and injection, screen capture and virtual display, privileged helper, local command bus (today's named pipe; any feature registers CLI commands) | no protocol knowledge; faked in tests |
+| `features/` | one module per feature: protocol handlers plus a small public API (`FilesApi.send`, `ClipboardApi.put_image`, …) | uses other features only through their public API; dependencies declared and acyclic |
+| `entry/` | user gestures and OS entry points: QS tiles, share router (clipboard vs file decided in one place), notification actions, Explorer verb and SendTo, CLI, tray menu | calls feature APIs only |
+| app (composition root) | `app.py` / `BridgeService.kt`: feature factories and wiring | the only place that knows every module |
+
+- Each feature handles messages on its own serial queue (Kotlin `limitedParallelism(1)`, Python a per-feature task queue), so a slow feature never blocks the link or another feature.
+- The control connection carries only small messages; large clip bodies, files, video and input travel on streams, so nothing large delays a clip or a keystroke.
+- `peer.supports(name, version)` comes from `hello`; the UI hides actions the peer cannot handle.
+- Per-feature golden messages in `protocol/features/<name>.json` feed both test suites (like the crypto vectors); a JVM interop test runs the Kotlin link against the Python server.
+- One shared log-redaction helper (lengths and hashes only).
+
+A new feature is then one module, its API and one register line; it can open streams, make requests, check peer support and use clipboard, notifications and power locks without touching other features.
+
+## Continuity features (feasibility on Windows + stock Android)
+Stock Android gives an ordinary app no tethering control, no input injection into other apps, no silent screen capture and no background clipboard reads. Three tiers, most seamless first:
+1. **Privileged helper**: the PC starts a small helper on the phone over adb (`app_process`, the scrcpy/Shizuku model). It runs as the `shell` user until the phone reboots and can inject input (virtual UHID mouse and keyboard), capture the screen without a prompt and read the clipboard in the background. A restart after a phone reboot needs adb again (USB, or wireless debugging; check whether the vivo keeps wireless debugging across reboots).
+2. **Accessibility service + own IME + overlay cursor**: no adb; gesture-based input (50–200 ms, no hover). Sideloaded apps may need "Allow restricted settings".
+3. **Plain app**: a notification the user taps.
+
+| Feature | Best achievable | Needs | Effort |
+|---|---|---|---|
+| Phone→PC clipboard without a tap | zero taps | tier 1 helper, or tier 2 copy detection + `ClipTrigger` | S once the helper exists |
+| Laptop shares its network; phone joins | near zero-touch after one approval | Windows Mobile Hotspot from code (WinRT `NetworkOperatorTetheringManager`; check admin needs) + Android `WifiNetworkSuggestion` | S–M |
+| Link when Wi-Fi isolates clients (campus, hotel) | automatic fallback | bearers: laptop hotspot, USB `adb reverse tcp:8765 tcp:8765` | M |
+| Phone screen mirrored and controlled on the PC | scrcpy level | helper, media stream, input injection | M |
+| Phone hotspot for the laptop (Instant Hotspot) | 1–2 taps on a phone notification; zero only if the helper can start tethering (check `adb shell cmd wifi help` and `cmd -l` on the vivo) | Bluetooth bearer for the request when no network is shared; Windows joins the saved hotspot profile (`netsh wlan connect`) | M–H |
+| PC mouse and keyboard on the phone (Universal Control) | near Apple with the helper (real cursor via UHID); laggy with tier 2 | Windows low-level hooks on a lean thread (Windows silently drops hooks slower than `LowLevelHooksTimeout`; elevated windows and the secure desktop are out of reach), screen-edge layout, clipboard push on crossing, drag across the edge = `send_file` | H |
+| Phone or tablet as trackpad and keyboard for the PC | good while our app is in front | `SendInput` on Windows | S–M |
+| Tablet as a second display (Sidecar) | SpaceDesk level, ~30–60 ms on 5 GHz | signed virtual display driver (one admin install); capture + hardware H.264/HEVC outside Python (native helper or ffmpeg `ddagrab`); MediaCodec low-latency decode; touch and pen back via `InjectSyntheticPointerInput`. Fastest route: orchestrate Sunshine (or a fork that creates the virtual display, e.g. Apollo) + Moonlight: one click creates the display, starts the stream, opens Moonlight and pairs over the link | M orchestrated, H own pipeline |
+
+Every external tool or driver goes into `docs/FOOTPRINT.md` with its removal step before it ships.
+
 ## Expected latency (same Wi-Fi)
 | Path | Typical | Worst normal | Dominated by |
 |---|---|---|---|
@@ -161,6 +199,16 @@ On the extender, Wi-Fi stalls of 10–20 s drop the link; the transfer reconnect
 8. Windows shell: `clipbridge send` + named pipe, context-menu verb, SendTo shortcut, `uninstall --purge`.
 9. Android: `link/Transfer.kt` (data connections over OkHttp, Wi-Fi lock), `features/files/`, share target for any file. Independent of 7–8 (works from the spec) → can run in parallel.
 10. File transfer end to end on the vivo + speed benchmark (`STREAMS` 1 vs 3 against a raw-socket ceiling).
+11. Review fixes: the top 5 of `docs/REVIEW.md` (PSK out of backups, per-device keys, network exposure and pre-auth limits, manual-host crash, clipboard privacy formats), then B2/B3 (lost `xfer_done`, disk errors and missing timeouts).
+12. Link: `hello` + device registry + per-device keys (`PROTOCOL.md` §2/§3), then request/response.
+13. Link: streams; file transfer moves onto them; large clip bodies leave the control connection.
+14. Platform and entry layers (Target layering): extract clipboard access, notifications/tray, settings, storage, power and the command bus; share router in `entry/`; per-feature serial queues; `CLAUDE.md` layout and layering rule updated. No behaviour change; tests stay green.
+15. Privileged helper (Android, started over adb) as a platform service; first user: phone→PC clipboard without a tap.
+16. Bearers: laptop Mobile Hotspot + `WifiNetworkSuggestion`, USB via `adb reverse`; the link uses the first that answers. Independent of 15.
+17. Phone mirroring on the PC (media stream + input injection through the helper).
+18. Input sharing PC→phone (edge crossing, UHID through the helper, tier 2 fallback) and phone-as-trackpad.
+19. Tablet as a second display (orchestrated Sunshine/Apollo + Moonlight first).
+20. Bluetooth bearer + Instant Hotspot.
 
 ## Verification
 - `pytest windows/tests` and `gradlew :app:testDebugUnitTest` — both pass identical vectors.
@@ -173,4 +221,4 @@ On the extender, Wi-Fi stalls of 10–20 s drop the link; the transfer reconnect
 ## Out of scope v1 (designed to slot in)
 Done since v1: image clips both ways, share target (text + images), "Send screenshot" QS tile, file transfer (steps 6–10).
 Still out: tray UI, clipboard history, sending folders, choosing among several phones, Windows 11 compact context menu (needs a packaged app).
-- TODO: AccessibilityService auto-trigger for phone→PC (detect Copy action / "Copied" toast, then `ReaderActivityTrigger(this).requestRead()`); sideloaded apps need "Allow restricted settings". Untested on the V2502; the `ClipTrigger` seam is already in place.
+- Phone→PC without a tap: tier 1 (privileged helper, step 15) or tier 2 (AccessibilityService detects a Copy action or "Copied" toast, then `ReaderActivityTrigger(this).requestRead()`; sideloaded apps need "Allow restricted settings"; untested on the V2502). The `ClipTrigger` seam serves both.

@@ -25,10 +25,11 @@ class SyncEngine {
     private var lastHash: String? = null
     private var pending: Clip? = null
 
+    /** [force]: explicit user send (tile/share), resent even if it matches lastHash so a lost send can be retried. */
     @Synchronized
-    fun onLocal(clip: Clip, connected: Boolean): Local {
+    fun onLocal(clip: Clip, connected: Boolean, force: Boolean = false): Local {
         val h = hash(clip)
-        if (h == lastHash) return Local.Drop
+        if (!force && h == lastHash) return Local.Drop
         lastHash = h
         if (connected) { pending = null; return Local.Send(clip) }
         pending = clip

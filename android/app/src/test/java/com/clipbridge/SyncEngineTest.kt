@@ -20,6 +20,14 @@ class SyncEngineTest {
         assertEquals(Local.Send(t("b")), e.onLocal(t("b"), true))
     }
 
+    @Test fun forcedLocalResendsDuplicate() {
+        val e = SyncEngine()
+        e.onLocal(t("a"), true)
+        assertEquals(Local.Send(t("a")), e.onLocal(t("a"), true, force = true))
+        assertEquals(Local.Hold, e.onLocal(t("a"), false, force = true))
+        assertEquals(t("a"), e.onConnected())
+    }
+
     @Test fun remoteWriteThenLocalEchoIsDropped() {
         val e = SyncEngine()
         assertTrue(e.onRemote(t("x")))

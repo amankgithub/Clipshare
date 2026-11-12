@@ -45,11 +45,12 @@ class ClipboardFeature(
     /** Entry point for any trigger (reader activity, share target, ...). */
     fun onLocalClip(text: String) { if (text.isNotEmpty()) onLocal(Clip.Text(text)) }
 
-    fun onLocalImage(png: ByteArray) { if (png.isNotEmpty()) onLocal(Clip.Image(png)) }
+    /** Images only come from explicit user actions, so a repeat tap always resends (retry after a lost send). */
+    fun onLocalImage(png: ByteArray) { if (png.isNotEmpty()) onLocal(Clip.Image(png), force = true) }
 
-    private fun onLocal(clip: Clip) {
+    private fun onLocal(clip: Clip, force: Boolean = false) {
         val connected = synchronized(peers) { peers.isNotEmpty() }
-        when (val r = engine.onLocal(clip, connected)) {
+        when (val r = engine.onLocal(clip, connected, force)) {
             is SyncEngine.Local.Send -> send(r.clip)
             else -> {}
         }

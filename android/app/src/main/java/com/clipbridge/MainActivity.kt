@@ -36,6 +36,8 @@ import androidx.compose.ui.unit.dp
 class MainActivity : ComponentActivity() {
     private val tick = mutableIntStateOf(0)
 
+    private val mediaPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { tick.intValue++ }
+
     private val notifPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { tick.intValue++ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -84,6 +86,10 @@ class MainActivity : ComponentActivity() {
             }
             Check("Draw over other apps (needed to read clipboard in background)", AndroidSettings.canDrawOverlays(this@MainActivity)) {
                 startActivity(Intent(AndroidSettings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            }
+            Check("Photos access (for Send screenshot tile)",
+                t.let { granted(com.clipbridge.features.clipboard.SendScreenshotTile.permission()) }) {
+                mediaPerm.launch(com.clipbridge.features.clipboard.SendScreenshotTile.permission())
             }
             Check("Battery optimization exempt",
                 getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)) {

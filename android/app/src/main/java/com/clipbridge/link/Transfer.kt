@@ -31,8 +31,8 @@ import java.security.MessageDigest
  *   data connection, whichever side sends the file.
  * - Outgoing files wait in an in-memory FIFO and are offered one at a time; an unfinished file is
  *   re-offered with the same `id` after a reconnect.
- * - Range work (send or receive) runs on [TransferCore.STREAMS] workers per control connection, each
- *   keeping one data connection open while there is work.
+ * - Range work runs on [TransferCore.STREAMS] workers per direction (send, receive) per control connection,
+ *   each keeping one data connection open while there is work.
  * - Received ranges are checkpointed (synced bytes + state file) so a reconnect resumes them.
  */
 class Transfer(
@@ -77,7 +77,9 @@ class Transfer(
     private class Link(val peer: Peer, val psk: ByteArray, val endpoint: Endpoint, parent: Job) {
         val job = SupervisorJob(parent)
         val scope = CoroutineScope(job + Dispatchers.IO)
-        val jobs = Channel<RangeJob>(Channel.UNLIMITED)
+        /** Sends and receives queue apart, so a large file in one direction never holds up the other. */
+        val sends = Channel<RangeJob>(Channel.UNLIMITED)
+        val recvs = Channel<RangeJob>(Channel.UNLIMITED)
     }
 
     private val scope = CoroutineScope(SupervisorJob(parent.coroutineContext[Job]) + Dispatchers.IO)
@@ -98,7 +100,10 @@ class Transfer(
     fun onLinkUp(peer: Peer, psk: ByteArray, endpoint: Endpoint) {
         val l = Link(peer, psk, endpoint, scope.coroutineContext[Job]!!)
         link = l
-        repeat(TransferCore.STREAMS) { l.scope.launch { worker(l) } }
+        repeat(TransferCore.STREAMS) {
+            l.scope.launch { worker(l, l.sends) }
+            l.scope.launch { worker(l, l.recvs) }
+        }
         wake.trySend(Unit)
     }
 
@@ -106,7 +111,8 @@ class Transfer(
     fun onLinkDown() {
         val l = link ?: return
         link = null
-        l.jobs.close()
+        l.sends.close()
+        l.recvs.close()
         l.scope.cancel() // receive jobs checkpoint as they unwind
         synchronized(lock) { incoming.clear() }
     }
@@ -154,7 +160,7 @@ class Transfer(
         val ranges = TransferCore.parseRanges(reply.opt("ranges"), out.offer.size)
         if (ranges == null) { control(TransferCore.cancel(out.offer.id)); return Outcome.CANCELLED }
         out.onProgress(ranges.sumOf { it.have })
-        ranges.forEach { l.jobs.send(RangeJob.Send(out, it)) }
+        ranges.forEach { l.sends.send(RangeJob.Send(out, it)) }
         return out.done.await()
     }
 
@@ -198,7 +204,7 @@ class Transfer(
         log("recv ${offer.id.take(8)} ${offer.size} B, resuming at ${inc.received()} B")
         feature.onFileProgress(peer, offer, inc.received())
         if (inc.ranges.isEmpty()) complete(inc)
-        inc.ranges.forEach { l.jobs.send(RangeJob.Recv(inc, it)) }
+        inc.ranges.forEach { l.recvs.send(RangeJob.Recv(inc, it)) }
     }
 
     /** Every range ended with a matching hash: commit, report, forget. */
@@ -234,11 +240,11 @@ class Transfer(
 
     private enum class Result { OK, ABORTED, BROKEN }
 
-    private suspend fun worker(l: Link) {
+    private suspend fun worker(l: Link, jobs: Channel<RangeJob>) {
         var conn: DataConn? = null
         try {
             while (true) {
-                val next = if (conn == null) l.jobs.receiveCatching() else withTimeoutOrNull(IDLE_MS) { l.jobs.receiveCatching() }
+                val next = if (conn == null) jobs.receiveCatching() else withTimeoutOrNull(IDLE_MS) { jobs.receiveCatching() }
                 if (next == null) { conn?.close(1000); conn = null; continue } // idle: close the data connection
                 val job = next.getOrNull() ?: return
                 if (aborted(job)) continue

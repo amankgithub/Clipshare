@@ -7,8 +7,12 @@ import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import com.clipbridge.BridgeService
+import com.clipbridge.features.files.ContentSource
 
-// Share target: SEND for text and image types, SEND_MULTIPLE for images. Images are converted to PNG.
+/**
+ * Share target: SEND for text, SEND / SEND_MULTIPLE for any files. Images go through the clipboard
+ * image path (converted to PNG); every other file, and any image too big for a clip, goes through file transfer.
+ */
 class ShareTargetActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -16,28 +20,42 @@ class ShareTargetActivity : Activity() {
         when (i?.action) {
             Intent.ACTION_SEND -> {
                 val uri = uriExtra(i)
-                if (uri != null && i.type?.startsWith("image/") == true) sendImages(listOf(uri))
+                if (uri != null) sendUris(listOf(uri))
                 else i.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
                     ?.takeIf { it.isNotEmpty() }?.let { BridgeService.submit(this, it) }
             }
-            Intent.ACTION_SEND_MULTIPLE -> sendImages(uriList(i))
+            Intent.ACTION_SEND_MULTIPLE -> sendUris(uriList(i))
         }
         finish()
         overridePendingTransition(0, 0)
     }
 
-    /** Toasts "Sending…" now; [ImageDelivery] toasts each image's outcome when the PC confirms. */
-    private fun sendImages(uris: List<Uri>) {
-        val sent = uris.count { uri ->
-            ImageUtil.readPng(this, uri)?.takeIf { it.isNotEmpty() }?.let { BridgeService.submitImage(this, it) } != null
+    /**
+     * Toasts "Sending…" now; the result comes later ([ImageDelivery] per image, the files feature per file).
+     * Files are opened here, while this activity holds the share grant.
+     */
+    private fun sendUris(uris: List<Uri>) {
+        var images = 0
+        val files = ArrayList<ContentSource>()
+        for (uri in uris) {
+            val file = ContentSource.open(this, uri)
+            val png = if (isImage(uri) && (file == null || file.size <= ImageUtil.MAX_BYTES)) {
+                ImageUtil.readPng(this, uri)?.takeIf { it.isNotEmpty() && it.size <= ImageUtil.MAX_BYTES }
+            } else null
+            if (png != null) { file?.close(); BridgeService.submitImage(this, png); images++ }
+            else if (file != null) files += file
         }
+        BridgeService.submitFiles(this, files)
         val msg = when {
-            sent == 0 -> "Couldn't read image"
-            sent == 1 -> "Sending image to PC…"
-            else -> "Sending $sent images to PC…"
+            images + files.size == 0 -> "Couldn't read " + if (uris.size == 1) "file" else "files"
+            files.isEmpty() -> if (images == 1) "Sending image to PC…" else "Sending $images images to PC…"
+            images == 0 && files.size == 1 -> "Sending ${files[0].name} to PC…"
+            else -> "Sending ${images + files.size} files to PC…"
         }
         Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
     }
+
+    private fun isImage(uri: Uri): Boolean = (contentResolver.getType(uri) ?: intent.type)?.startsWith("image/") == true
 
     @Suppress("DEPRECATION")
     private fun uriExtra(i: Intent): Uri? =

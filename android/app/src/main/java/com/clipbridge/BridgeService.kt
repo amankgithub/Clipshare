@@ -14,13 +14,17 @@ import com.clipbridge.features.clipboard.ClipboardFeature
 import com.clipbridge.features.clipboard.ClipboardWriter
 import com.clipbridge.features.clipboard.ImageDelivery
 import com.clipbridge.features.clipboard.ReaderActivityTrigger
+import com.clipbridge.features.files.ContentSource
+import com.clipbridge.features.files.FilesFeature
 import com.clipbridge.link.BridgeClient
 import com.clipbridge.link.Discovery
 import com.clipbridge.link.Endpoint
 import com.clipbridge.link.FeatureRouter
 import com.clipbridge.link.LinkState
 import com.clipbridge.link.NetworkWatcher
+import com.clipbridge.link.PartialStore
 import com.clipbridge.link.Status
+import com.clipbridge.link.TransferLock
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -37,6 +41,7 @@ class BridgeService : Service() {
     private lateinit var network: NetworkWatcher
     private lateinit var client: BridgeClient
     private lateinit var clipboard: ClipboardFeature
+    private lateinit var files: FilesFeature
 
     override fun onCreate() {
         super.onCreate()
@@ -46,6 +51,7 @@ class BridgeService : Service() {
 
         discovery = Discovery(this)
         val router = FeatureRouter { Log.w(TAG, it) }
+        val transferLock = TransferLock(this)
         client = BridgeClient(
             scope = scope,
             deviceId = settings.deviceId,
@@ -53,10 +59,14 @@ class BridgeService : Service() {
             endpointsProvider = { Endpoint.order(settings.manual, discovery.found.value, settings.cached) },
             router = router,
             onGoodEndpoint = { settings.cached = it },
+            partials = PartialStore(java.io.File(filesDir, "partial")),
+            onTransferBusy = transferLock::hold,
             log = { Log.i(TAG, it) },
         )
         clipboard = ClipboardFeature(client, ClipboardWriter(this))
         router.register(clipboard)
+        files = FilesFeature(this, client)
+        router.register(files)
 
         network = NetworkWatcher(this, onAvailable = { client.retryNow() }, onLost = { client.networkLost() })
         network.start()
@@ -85,6 +95,7 @@ class BridgeService : Service() {
                     if (png != null) clipboard.onLocalImage(png, report) else report(false)
                 }
             }
+            ACTION_SEND_FILES -> generateSequence { outgoingFiles.poll() }.forEach { files.send(it) }
             ACTION_RECONFIG -> client.reconnect()
         }
         return START_STICKY
@@ -131,6 +142,7 @@ class BridgeService : Service() {
         const val ACTION_SEND_TEXT = "com.clipbridge.SEND_TEXT"
         const val ACTION_SEND_IMAGE = "com.clipbridge.SEND_IMAGE"
         const val EXTRA_PATH = "path"
+        const val ACTION_SEND_FILES = "com.clipbridge.SEND_FILES"
         const val ACTION_RECONFIG = "com.clipbridge.RECONFIG"
         const val EXTRA_TEXT = "text"
 
@@ -161,6 +173,16 @@ class BridgeService : Service() {
             context.startForegroundService(
                 Intent(context, BridgeService::class.java).setAction(ACTION_SEND_IMAGE).putExtra(EXTRA_PATH, f.absolutePath)
             )
+        }
+
+        /** Shared files opened by the share target, waiting for the service (same process). */
+        private val outgoingFiles = java.util.concurrent.ConcurrentLinkedQueue<ContentSource>()
+
+        /** Hand opened files to the service for [FilesFeature.send] (descriptors cannot travel in an intent). */
+        fun submitFiles(context: Context, sources: List<ContentSource>) {
+            if (sources.isEmpty()) return
+            outgoingFiles.addAll(sources)
+            context.startForegroundService(Intent(context, BridgeService::class.java).setAction(ACTION_SEND_FILES))
         }
 
         fun reconfigure(context: Context) {

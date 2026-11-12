@@ -13,10 +13,15 @@ no line breaks. Decoders reject any other alphabet, missing padding, or wrong de
 - **Server** = Windows laptop. WebSocket server on `0.0.0.0:8765`, advertised over mDNS as
   `_clipbridge._tcp.local.` (port in the SRV record). Accepts any number of clients.
 - **Client** = Android device. Connects to `ws://<host>:8765/`.
-- WebSocket subprotocol: `clipbridge.v1`. The client must offer it; the server must reject the
-  HTTP upgrade (HTTP 400) if it is not offered; the client must abort if the server did not select it.
-- After the handshake (section 3) the link is symmetric: both sides send and receive the same
-  frame format and features do not know which side is the server.
+- Two connection kinds share the port, told apart by the WebSocket subprotocol:
+  - `clipbridge.v1`: the **control connection**. One per client; carries every feature message.
+  - `clipbridge.data.v1`: a **data connection**. Carries only file-transfer bytes (section 6.2),
+    so a large file never delays control messages. A client opens zero or more of them.
+  The client must offer exactly one of the two; the server must reject the HTTP upgrade (HTTP 400)
+  if neither is offered; the client must abort if the server did not select the one it offered.
+- Both kinds use the same handshake (section 3), keys (section 4) and frames (section 5).
+- After the handshake the link is symmetric: both sides send and receive the same frame format
+  and features do not know which side is the server.
 
 ## 2. Shared secret and identities
 
@@ -48,8 +53,9 @@ no line breaks. Decoders reject any other alphabet, missing padding, or wrong de
 - The server may send encrypted frames immediately after `auth_ok`.
 - Timeout: the server closes **4408** if a valid `auth` has not arrived within 10 s of the
   WebSocket opening. The client closes **4408** if `auth_ok` has not arrived within 10 s of sending `auth`.
-- If a client authenticates with a `device` that already has a live connection, the server
-  closes the **older** connection with **4409** (stale socket after a network change).
+- If a client authenticates a **control** connection with a `device` that already has a live
+  control connection, the server closes the **older** one with **4409** (stale socket after a
+  network change). Data connections never replace anything and are never replaced.
 
 ## 4. Session keys
 
@@ -106,7 +112,7 @@ plaintext = header_len (u32, big-endian) ‖ header (header_len bytes, JSON, UTF
   either side upgrade first).
 - Within a feature, unknown `type` or `kind` values → ignore. Unknown header keys → ignore.
 - `ch` values starting with `link` are reserved for link-layer control messages (section 6.1).
-  They are handled by the link and never delivered to a feature.
+  They are handled by the link and never delivered to a feature (sections 6.1 and 6.2).
 - The header key `mid` is reserved for the link (section 6.1); features must not use it.
 
 ### 6.1 Delivery receipts (`ch = "link"`)
@@ -132,6 +138,62 @@ Any feature message may ask for a receipt, so the sender learns that the peer ac
   the connection closes first. Retrying is the feature's (or user's) choice.
 - A receipt covers only the direct peer. When the server relays a message to other clients, the
   receipt does not mean they received it.
+
+### 6.2 File transfer (link service)
+
+Moves one file of any size from the side that has it (**sender**) to the other side
+(**receiver**), on behalf of a feature. Control messages travel on the control connection with
+`ch = "link"`; file bytes travel on data connections. Files are never relayed to other clients.
+
+**Control messages** (control connection, empty body):
+
+| Type | Direction | Header fields |
+|---|---|---|
+| `xfer_offer` | sender → receiver | `id`, `feature`, `name`, `size`, `meta` |
+| `xfer_accept` | receiver → sender | `id`, `ranges` |
+| `xfer_reject` | receiver → sender | `id` |
+| `xfer_done` | receiver → sender | `id`, `ok` |
+| `xfer_cancel` | either | `id` |
+
+- `id`: 32 lowercase hex characters (16 random bytes), chosen by the sender. A re-offer of the
+  same file after a reconnect reuses the same `id`.
+- `feature`: name of the feature that handles the file on the receiver (as in `ch`). Unknown
+  feature, or the feature declines → `xfer_reject`.
+- `name`: file base name, 1 to 255 characters. The receiver strips any path and replaces
+  characters its file system forbids; it never writes outside the destination the feature chose.
+- `size`: file length in bytes (integer ≥ 0). `meta`: JSON object for the feature (may be `{}`).
+- `ranges`: list of `[start, end, have]` integers: the receiver stores bytes `[start, end)` as one
+  range, of which the first `have` bytes are already on disk. For a new file `have` is 0. Ranges
+  are sorted, do not overlap, and together cover `[0, size)`. The receiver chooses the split (one
+  range, or up to one per data connection it wants); on a re-offer it repeats the same split with
+  updated `have`. A file of size 0 has `ranges = []`.
+- `ok`: `true` once every range has arrived and matched its hash and the file is in its final
+  place; `false` on a hash mismatch (the receiver discards the partial file and all its state for
+  that `id`). After `ok:false` the sender may offer the file once more with a new `id`.
+- `xfer_cancel`: both sides drop the transfer; the receiver deletes the partial file. The sender
+  stops streaming; open data connections for that `id` are closed (1000).
+- Messages with an unknown `id` → ignore.
+
+**Data connections** (subprotocol `clipbridge.data.v1`):
+
+- Always opened by the **client**, whichever side is the sender (the client does not accept
+  inbound connections). The client opens them after `xfer_accept` is sent or received, one per
+  range it streams at a time.
+- The client's first frame on it is `{"ch":"link","type":"xfer_attach","id":"<id>","start":<start>}`,
+  naming one accepted range. The server replies nothing; unknown `id` or `start` → close **4404**.
+- Then the **sender** of the file (client or server) sends, in order:
+  - `{"ch":"link","type":"xfer_data"}` frames whose bodies are consecutive file bytes from
+    `start + have` up to `end` (body 1 byte to 4 MiB each);
+  - then `{"ch":"link","type":"xfer_end","sha256":"<64 hex>"}`: SHA-256 of the whole range
+    `[start, end)`, including the `have` bytes already on disk (both sides hash that prefix from
+    local storage).
+- Bytes past `end`, an `xfer_end` before `end`, or any other message type → close **4400**.
+- After `xfer_end` the client may send another `xfer_attach` on the same connection (one
+  connection carries many ranges and files back to back), or close it (1000).
+- The receiver sends `xfer_done` on the control connection once every range of the file has ended.
+- If the control connection closes, both sides close that client's data connections. The sender
+  re-offers unfinished files after reconnecting; the receiver answers with its current `have`
+  values. How long a receiver keeps partial files of an unfinished `id` is its choice.
 
 ## 7. Clipboard feature (`ch = "clipboard"`)
 
@@ -189,6 +251,7 @@ Image clip:
 | 4400 | Protocol violation (malformed/unexpected handshake message, text frame after handshake) | either |
 | 4401 | Authentication failed (bad MAC). Reason always empty | either |
 | 4402 | Frame integrity failure (bad length, nonce padding, counter, or GCM tag) | either |
+| 4404 | Data connection attached to an unknown transfer `id` or range | server |
 | 4408 | Handshake timeout | either |
 | 4409 | Replaced by a newer connection with the same `device` | server |
 | 4426 | Unsupported protocol version | server |

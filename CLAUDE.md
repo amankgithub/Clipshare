@@ -1,17 +1,19 @@
 # ClipBridge
 
 Zero-cloud, LAN-only secure link between a Windows laptop (server) and Android devices (clients).
-Clipboard sync is the first feature on that link. Full plan: `docs/PLAN.md`. Wire spec: `protocol/PROTOCOL.md`.
+Features on that link: clipboard sync and file transfer (`files`). Full plan: `docs/PLAN.md`. Wire spec: `protocol/PROTOCOL.md`.
 
 ## Layout
 - `windows/` Python >= 3.10 package `clipbridge` (`src/clipbridge/link/`, `src/clipbridge/features/`), tests in `windows/tests/`.
-- `android/` Kotlin app, single `app` module, package `com.clipbridge` (`link.*`, `features.clipboard.*`).
+- `android/` Kotlin app, single `app` module, package `com.clipbridge` (`link.*`, `features.<name>.*`).
 - `protocol/` `PROTOCOL.md` (normative), `gen_vectors.py`, `test_vectors.json` (shared by both test suites).
-- `docs/` plan and notes. `spike/` is a throwaway experiment: ignored, never committed.
+- `docs/` plan, `FOOTPRINT.md` (everything installed on either device + how to remove it). `spike/` is a throwaway experiment: ignored, never committed.
 
 ## Layering rule (most important)
-- **Link layer**: discovery, connect/reconnect, handshake, crypto, liveness, peer registry. Knows nothing about features.
-- **Feature layer**: one module per feature (`name`, `on_peer_connected`, `on_peer_disconnected`, `on_message(peer, header, body)`), uses `send(peer|all, header, body)`.
+- **Link layer**: discovery, connect/reconnect, handshake, crypto, liveness, peer registry, and general
+  services: delivery receipts, file transfer (data connections). Knows nothing about features.
+- **Feature layer**: one module per feature (`name`, `on_peer_connected`, `on_peer_disconnected`, `on_message(peer, header, body)`), uses `send(peer|all, header, body)`;
+  features that take files add `on_file_offer` / `on_file_received` and use `send_file`.
 - Link routes by `header.ch`. Never put feature code or feature names inside the link layer. A new feature = new module + one register line per side.
 - Generic needs (delivery receipts, request/response, file transfer, ...) belong in the link layer as
   general services any feature can use, never as one feature's special case.
@@ -39,6 +41,9 @@ Write it as if the project had been designed with it from day one:
 - Protocol changes: edit `PROTOCOL.md` first, regenerate vectors, then both implementations.
 - Never log PSKs, keys, or clipboard contents (log lengths/hashes only).
 - No over-engineering: build only what the current step of `docs/PLAN.md` needs.
+- No new dependencies without listing them in `docs/FOOTPRINT.md` with their removal step. Python deps
+  live only in `windows/.venv`; anything written outside the repo (registry, shortcuts, AppData) must be
+  undone by `clipbridge uninstall [--purge]`.
 
 ## Working in sessions
 Each build step in `docs/PLAN.md` runs in its own fresh session to save usage.

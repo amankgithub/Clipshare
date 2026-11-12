@@ -75,6 +75,14 @@ class BridgeService : Service() {
             ACTION_SEND_TEXT -> intent.getStringExtra(EXTRA_TEXT)?.let { text ->
                 scope.launch { clipboard.onLocalClip(text) }
             }
+            ACTION_SEND_IMAGE -> intent.getStringExtra(EXTRA_PATH)?.let { path ->
+                scope.launch {
+                    val f = java.io.File(path)
+                    val png = runCatching { f.readBytes() }.getOrNull()
+                    f.delete()
+                    if (png != null) clipboard.onLocalImage(png)
+                }
+            }
             ACTION_RECONFIG -> client.reconnect()
         }
         return START_STICKY
@@ -119,6 +127,8 @@ class BridgeService : Service() {
         private const val CHANNEL = "link"
         private const val NOTIF_ID = 1
         const val ACTION_SEND_TEXT = "com.clipbridge.SEND_TEXT"
+        const val ACTION_SEND_IMAGE = "com.clipbridge.SEND_IMAGE"
+        const val EXTRA_PATH = "path"
         const val ACTION_RECONFIG = "com.clipbridge.RECONFIG"
         const val EXTRA_TEXT = "text"
 
@@ -140,6 +150,14 @@ class BridgeService : Service() {
         fun submit(context: Context, text: String) {
             context.startForegroundService(
                 Intent(context, BridgeService::class.java).setAction(ACTION_SEND_TEXT).putExtra(EXTRA_TEXT, text)
+            )
+        }
+
+        /** Hand a PNG to the service via a staged temp file (intents cannot carry big payloads). */
+        fun submitImage(context: Context, png: ByteArray) {
+            val f = com.clipbridge.features.clipboard.ImageUtil.stage(context, png)
+            context.startForegroundService(
+                Intent(context, BridgeService::class.java).setAction(ACTION_SEND_IMAGE).putExtra(EXTRA_PATH, f.absolutePath)
             )
         }
 

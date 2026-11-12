@@ -13,9 +13,13 @@ Device: vivo V2502, Android 16. Server on Windows, LAN 192.168.1.x.
 | 4 | Wrong-PSK client rejected | PASS | close code 4401, log "auth failed (bad MAC)" |
 | 5a | Phone Wi-Fi off/on reconnect | PASS | ~5 s after enable |
 | 5b | Server restart, phone reconnects | PASS | ~1 s |
-| 6a | `clipbridge install` (task + firewall) | NOT RUN | blocked by auto-mode classifier; user to run manually |
-| 6b | Phone reboot auto-start | NOT RUN | needs vivo "Allow background power usage" first |
+| 6a | `clipbridge install` (task + firewall) | PASS | user ran it; task registered, firewall rule present, `schtasks /Run` starts pythonw daemon, phone connects |
+| 6b | Phone reboot auto-start | PASS | service up and connected ~30 s after boot (vivo background power usage allowed) |
 
 Fix made: Android now logs clip send/receive (length + hash only, tag `ClipBridge`) so e2e is observable (commit "Android: log clip send/receive").
 
-Open observation: one unexplained "auth failed (bad MAC)" from the phone at 14:30:44 while the user was toggling Wi-Fi; not reproduced in a controlled Wi-Fi toggle. Self-recovered.
+Gotcha: the Claude desktop tool shell virtualizes %APPDATA%/%LOCALAPPDATA%, so `pair` run from it writes a different PSK than the real daemon uses (symptom: endless "bad MAC"). Run `pair` from a normal terminal.
+
+Not tested: PC sleep/resume, PC reboot/logon trigger, kill-pythonw restart.
+
+Earlier observation (probably the same PSK mismatch): one unexplained "auth failed (bad MAC)" from the phone at 14:30:44 while the user was toggling Wi-Fi; not reproduced in a controlled Wi-Fi toggle. Self-recovered.

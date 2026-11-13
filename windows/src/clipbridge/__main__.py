@@ -1,4 +1,4 @@
-"""CLI: run | pair | send | install | uninstall | status."""
+"""CLI: run | pair | devices | unpair | send | install | uninstall | status."""
 
 from __future__ import annotations
 
@@ -37,19 +37,53 @@ def _find_adb() -> str | None:
 
 
 def pair() -> int:
-    psk_b64 = base64.b64encode(config.get_or_create_psk()).decode("ascii")
+    """Register a new device with its own key, push it to the phone via adb and print it."""
+    device = config.new_device_id()
+    psk_b64 = base64.b64encode(config.DeviceRegistry().pair(device)).decode("ascii")
     host = _primary_ip()
-    print(f"PSK (b64): {psk_b64}\nHost:      {host}")
+    print(f"Device:       {device}\nPairing code: {device}:{psk_b64}\nHost:         {host}")
     adb = _find_adb()
     if adb is None:
-        print("adb not found; enter the key and host in the app manually.")
+        print("adb not found; enter the pairing code and host in the app manually.")
         return 1
-    cmd = [adb, "shell", "am", "start", "-n", ANDROID_ACTIVITY, "--es", "psk", psk_b64, "--es", "host", host]
+    cmd = [
+        adb, "shell", "am", "start", "-n", ANDROID_ACTIVITY,
+        "--es", "device", device, "--es", "psk", psk_b64, "--es", "host", host,
+    ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0 or "Error" in result.stdout:
         print("adb pairing failed:", (result.stdout + result.stderr).strip())
         return 1
     print("Pushed to phone.")
+    return 0
+
+
+def devices() -> int:
+    paired = config.DeviceRegistry().load()
+    if not paired:
+        print("no paired devices (run pair)")
+    for device, entry in sorted(paired.items()):
+        print(f"{device}  {entry.name or '(not connected yet)'}")
+    return 0
+
+
+def unpair(device: str) -> int:
+    """Delete the device's key, then have a running server drop its live connections (4401)."""
+    import pywintypes
+
+    from clipbridge import pipe
+
+    if not config.DeviceRegistry().unpair(device):
+        print(f"{device}: not paired")
+        return 1
+    try:
+        pipe.send_request(pipe.Unpair(device))
+    except pipe.ServerNotRunning:
+        pass  # nothing is connected, and without its key the device cannot connect again
+    except pywintypes.error as e:
+        print(f"{device}: key removed, live connections not dropped ({e.strerror}); restart the server")
+        return 1
+    print(f"{device}: unpaired")
     return 0
 
 
@@ -65,12 +99,12 @@ def _report(text: str) -> None:
 
 
 def send(args: list[str]) -> int:
-    from clipbridge.features.files import pipe
+    from clipbridge import pipe
 
     files, errors = pipe.validate_paths(args, Path.cwd())
     if files:
         try:
-            pipe.send_request(files)
+            pipe.send_request(pipe.Send(files))
         except pipe.ServerNotRunning:
             errors.append("ClipBridge is not running, so nothing was sent. Start it (task 'ClipBridge') and try again.")
             files = []
@@ -83,13 +117,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="clipbridge")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("run", help="run the server")
-    sub.add_parser("pair", help="push the key to the phone via adb and print it")
+    sub.add_parser("pair", help="pair a new phone: push its key via adb and print it")
+    sub.add_parser("devices", help="list paired phones")
+    unpair_parser = sub.add_parser("unpair", help="revoke a phone's key and disconnect it")
+    unpair_parser.add_argument("device")
     send_parser = sub.add_parser("send", help="send files to the phone through the running server")
     send_parser.add_argument("files", nargs="+")
     sub.add_parser("install", help="register task, firewall rule (UAC prompt), Explorer 'Send to phone'")
     uninstall_parser = sub.add_parser("uninstall", help="remove everything install added (UAC prompt)")
     uninstall_parser.add_argument(
-        "--purge", action="store_true", help="also delete config, key, logs and unfinished transfers"
+        "--purge", action="store_true", help="also delete config, device keys, logs and unfinished transfers"
     )
     sub.add_parser("status", help="show running/installed state")
     args = parser.parse_args(argv)
@@ -101,6 +138,10 @@ def main(argv: list[str] | None = None) -> int:
         return app.run()
     if command == "pair":
         return pair()
+    if command == "devices":
+        return devices()
+    if command == "unpair":
+        return unpair(args.device)
     if command == "send":
         return send(args.files)
     from clipbridge import install

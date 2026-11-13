@@ -36,8 +36,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.clipbridge.link.Pairing
 
-/** One-screen UI: status, manual host, PSK paste, permission checklist with fix buttons. */
+/** One-screen UI: status, manual host, pairing-code paste, permission checklist with fix buttons. */
 class MainActivity : ComponentActivity() {
     private val tick = mutableIntStateOf(0)
 
@@ -66,7 +67,7 @@ class MainActivity : ComponentActivity() {
     private fun Screen(settings: Settings) {
         val status by BridgeService.statusFlow.collectAsState()
         var host by remember { mutableStateOf(settings.manualHost) }
-        var psk by remember { mutableStateOf("") }
+        var code by remember { mutableStateOf("") }
         var msg by remember { mutableStateOf("") }
         val t = tick.intValue // re-read checklist on resume
 
@@ -76,18 +77,19 @@ class MainActivity : ComponentActivity() {
         ) {
             Text("ClipBridge", style = MaterialTheme.typography.headlineSmall)
             Text(BridgeService.describe(status))
-            Text(if (settings.psk != null) "PSK: set" else "PSK: not set")
+            Text(settings.pairing?.let { "Paired as ${it.device}" } ?: "Not paired")
 
             OutlinedTextField(host, { host = it }, Modifier.fillMaxWidth(), singleLine = true,
                 label = { Text("PC host (optional, ip or ip:port)") })
             Button({ settings.manualHost = host; BridgeService.reconfigure(this@MainActivity) }) { Text("Save host") }
 
-            OutlinedTextField(psk, { psk = it }, Modifier.fillMaxWidth(), singleLine = true,
-                label = { Text("Paste PSK (base64)") })
+            OutlinedTextField(code, { code = it }, Modifier.fillMaxWidth(), singleLine = true,
+                label = { Text("Paste pairing code (device:key)") })
             Button({
-                if (settings.setPsk(psk)) { psk = ""; msg = "PSK saved"; BridgeService.reconfigure(this@MainActivity) }
-                else msg = "Invalid PSK (need 32-byte base64)"
-            }) { Text("Save PSK") }
+                val pairing = Pairing.parseCode(code)
+                if (pairing != null) { settings.pairing = pairing; code = ""; msg = "Paired"; BridgeService.reconfigure(this@MainActivity) }
+                else msg = "Invalid pairing code (need <device>:<32-byte base64 key>)"
+            }) { Text("Save pairing") }
             if (msg.isNotEmpty()) Text(msg)
 
             Text("Permissions", style = MaterialTheme.typography.titleMedium)

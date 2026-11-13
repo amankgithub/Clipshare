@@ -3,6 +3,7 @@ package com.clipbridge.features.clipboard
 import com.clipbridge.link.Feature
 import com.clipbridge.link.LinkSender
 import com.clipbridge.link.Peer
+import com.clipbridge.link.Reply
 import android.util.Log
 import org.json.JSONObject
 
@@ -13,6 +14,7 @@ class ClipboardFeature(
     private val engine: SyncEngine = SyncEngine(),
 ) : Feature {
     override val name = "clipboard"
+    override val version = 1
 
     private val peers = HashSet<Peer>()
 
@@ -28,24 +30,25 @@ class ClipboardFeature(
 
     override fun onPeerDisconnected(peer: Peer) { synchronized(peers) { peers.remove(peer) } }
 
-    override fun onMessage(peer: Peer, header: JSONObject, body: ByteArray) {
-        if (header.optString("type") != "clip") return
+    override fun onMessage(peer: Peer, header: JSONObject, body: ByteArray): Reply? {
+        if (header.optString("type") != "clip") return null
         val clip: Clip = when (header.optString("kind")) {
-            "text" -> Clip.Text(header.opt("data") as? String ?: return)
+            "text" -> Clip.Text(header.opt("data") as? String ?: return null)
             "image" -> {
-                if (header.optString("mime") != "image/png" || body.isEmpty()) return
+                if (header.optString("mime") != "image/png" || body.isEmpty()) return null
                 Clip.Image(body)
             }
-            else -> return
+            else -> return null
         }
         val applied = engine.onRemote(clip)
         logClip("remote ${describe(clip)} applied=$applied")
-        if (!applied) return
+        if (!applied) return null
         takeHeldReport()?.invoke(false) // remote clip replaced our unsent one
         when (clip) {
             is Clip.Text -> writer.write(clip.text)
             is Clip.Image -> writer.writeImage(clip.png)
         }
+        return null
     }
 
     /** Entry point for any trigger (reader activity, share target, ...). */
@@ -87,7 +90,8 @@ class ClipboardFeature(
                 logClip("send ${describe(clip)}")
                 val h = JSONObject().put("ch", name).put("type", "clip").put("kind", "image")
                     .put("mime", "image/png").put("ts", System.currentTimeMillis())
-                sender.send(null, h, clip.png) { ok ->
+                sender.send(null, h, clip.png) { reply ->
+                    val ok = reply?.ok == true
                     logClip("image delivered=$ok")
                     onDelivered?.invoke(ok)
                 }

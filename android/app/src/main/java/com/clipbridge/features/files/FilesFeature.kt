@@ -7,6 +7,7 @@ import com.clipbridge.link.FileOffer
 import com.clipbridge.link.FileSink
 import com.clipbridge.link.LinkSender
 import com.clipbridge.link.Peer
+import com.clipbridge.link.Reply
 import org.json.JSONObject
 
 /**
@@ -15,13 +16,14 @@ import org.json.JSONObject
  */
 class FilesFeature(context: Context, private val sender: LinkSender) : FileFeature {
     override val name = "files"
+    override val version = 1
 
     private val app = context.applicationContext
     private val notifier = FileNotifier(app)
 
     override fun onPeerConnected(peer: Peer) {}
     override fun onPeerDisconnected(peer: Peer) {}
-    override fun onMessage(peer: Peer, header: JSONObject, body: ByteArray) {}
+    override fun onMessage(peer: Peer, header: JSONObject, body: ByteArray): Reply? = null
 
     override fun onFileOffer(peer: Peer, offer: FileOffer, resume: String?): FileSink =
         MediaStoreSink.reopen(app, resume, offer.size) ?: MediaStoreSink.create(app, offer.name, offer.size)

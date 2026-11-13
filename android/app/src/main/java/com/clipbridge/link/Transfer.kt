@@ -39,7 +39,6 @@ import kotlin.coroutines.CoroutineContext
 class Transfer(
     parent: CoroutineScope,
     private val http: OkHttpClient,
-    private val deviceId: String,
     private val router: FeatureRouter,
     private val store: PartialStore,
     private val control: (JSONObject) -> Boolean,
@@ -77,7 +76,7 @@ class Transfer(
     }
 
     /** One control connection's lifetime: its peer, credentials for data connections, and its workers. */
-    private class Link(val peer: Peer, val psk: ByteArray, val endpoint: Endpoint, parent: CoroutineContext) {
+    private class Link(val peer: Peer, val pairing: Pairing, val endpoint: Endpoint, parent: CoroutineContext) {
         val job = SupervisorJob(parent[Job])
         /** Keeps the parent's context (its CoroutineExceptionHandler included), with its own job. */
         val scope = CoroutineScope(parent + job + Dispatchers.IO)
@@ -104,8 +103,8 @@ class Transfer(
 
     // -- link lifecycle (called by the control connection) ---------------------------------------
 
-    fun onLinkUp(peer: Peer, psk: ByteArray, endpoint: Endpoint) {
-        val l = Link(peer, psk, endpoint, scope.coroutineContext)
+    fun onLinkUp(peer: Peer, pairing: Pairing, endpoint: Endpoint) {
+        val l = Link(peer, pairing, endpoint, scope.coroutineContext)
         link = l
         repeat(TransferCore.STREAMS) {
             l.scope.launch { worker(l, l.sends) }
@@ -489,7 +488,7 @@ class Transfer(
         val incoming = Channel<Envelope>(2)
         private val ready = CompletableDeferred<Boolean>()
         private val sock = SecureSocket(
-            scope = l.scope, psk = l.psk, deviceId = deviceId, endpoint = l.endpoint, subprotocol = DATA_SUBPROTOCOL,
+            scope = l.scope, pairing = l.pairing, endpoint = l.endpoint, subprotocol = DATA_SUBPROTOCOL,
             onReady = { ready.complete(true) },
             onPlaintext = { s, p ->
                 val env = try { Envelopes.parse(p) } catch (e: EnvelopeException) { null }

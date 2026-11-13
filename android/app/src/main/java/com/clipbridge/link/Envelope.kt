@@ -7,6 +7,9 @@ import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 
+/** `ch` of link-layer messages (PROTOCOL.md section 6); never a feature's. */
+const val LINK_CH = "link"
+
 class EnvelopeException(message: String) : Exception(message)
 
 class Envelope(val header: JSONObject, val body: ByteArray)

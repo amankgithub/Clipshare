@@ -166,11 +166,15 @@ class TransferService:
 
     async def on_peer_disconnected(self, peer: Peer) -> None:
         if self._peer_for(peer.device) is None:  # not replaced by a newer control connection
-            for conn in list(self._data_conns.get(peer.device, ())):
-                await conn.ws.close(1000)
+            await self.close_data(peer.device, 1000)
         for item in list(self._outgoing.values()):
             if item.peer is peer:
                 item.replies.put_nowait(_LOST)
+
+    async def close_data(self, device: str, code: int) -> None:
+        """Close every data connection of `device`."""
+        for conn in list(self._data_conns.get(device, ())):
+            await conn.ws.close(code)
 
     # -- control messages (from the control connection) ----------------------
     async def on_control(self, peer: Peer, header: dict[str, Any]) -> None:

@@ -11,6 +11,7 @@ from websockets.exceptions import ConnectionClosed
 
 from clipbridge.link import envelope
 from clipbridge.link.crypto import SecureChannel
+from clipbridge.link.requests import PendingRequests
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +30,14 @@ class Peer:
         self.device = device
         self.ws = ws
         self.channel = channel
+        self.name = ""  # from the peer's hello
+        self.features: dict[str, int] | None = None  # from the peer's hello; None until it arrives
+        self.requests = PendingRequests()
         self._lock = asyncio.Lock()
+
+    def supports(self, feature: str, version: int = 1) -> bool:
+        """The peer's hello lists `feature` at `version` or higher (PROTOCOL.md section 6.1)."""
+        return self.features is not None and self.features.get(feature, 0) >= version
 
     async def send(self, header: dict[str, Any], body: bytes = b"") -> None:
         """Encrypt and send one envelope. Raises EnvelopeTooLarge / CounterExhausted / ConnectionClosed."""

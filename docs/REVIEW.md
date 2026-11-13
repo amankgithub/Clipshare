@@ -30,7 +30,8 @@ Severity: **H** high, **M** medium, **L** low.
   `cloud-backup` and `device-transfer` (targetSdk 35 needs both). Optionally wrap the PSK with a non-exportable
   Android Keystore key.
 
-### A2. H: One PSK is shared by every client: device names are not authenticated, and any client can impersonate the server
+### A2. H: One PSK is shared by every client: device names are not authenticated, and any client can impersonate the server (fixed)
+- **Status**: Fixed in step 12. Each paired device has its own PSK in a DPAPI-protected registry (`devices.bin`); unknown device → 4401; `clipbridge unpair <device>` revokes one phone and drops its connections (PROTOCOL.md section 2). Tests: `test_config.py`, `test_server.py`.
 - `PROTOCOL.md:28-31,42-45`; `windows/src/clipbridge/config.py:43-53`; `link/server.py:158-165`
 - **What**: Every phone gets the same PSK. Any key holder can claim any `device` name. The server MAC proves only
   that the other side knows the PSK.

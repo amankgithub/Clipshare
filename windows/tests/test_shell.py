@@ -1,4 +1,4 @@
-"""Explorer entry points: send path validation, pipe request codec, pipe round trip, install data."""
+"""CLI entry points: send path validation, pipe request codec, pipe round trip, unpair, install data."""
 
 import json
 import threading
@@ -8,7 +8,7 @@ import pytest
 
 from clipbridge import install
 from clipbridge.__main__ import main
-from clipbridge.features.files import pipe
+from clipbridge import config, pipe
 
 
 def test_validate_paths_accepts_files_rejects_folders_and_missing(tmp_path: Path) -> None:
@@ -29,13 +29,20 @@ def test_validate_paths_resolves_relative_to_cwd(tmp_path: Path) -> None:
 
 def test_request_round_trip() -> None:
     paths = [Path(r"C:\Users\me\Ünïcode file.txt"), Path(r"D:\x\y.bin")]
-    data = pipe.encode_request(paths)
+    data = pipe.encode_request(pipe.Send(paths))
     assert json.loads(data) == {"send": [str(p) for p in paths]}
-    assert pipe.decode_request(data) == paths
+    assert pipe.decode_request(data) == pipe.Send(paths)
+    data = pipe.encode_request(pipe.Unpair("android-0a1b2c3d"))
+    assert json.loads(data) == {"unpair": "android-0a1b2c3d"}
+    assert pipe.decode_request(data) == pipe.Unpair("android-0a1b2c3d")
 
 
 @pytest.mark.parametrize(
-    "data", [b"", b"\xff", b"[]", b'{"other": []}', b'{"send": "C:\\\\a"}', b'{"send": [1]}']
+    "data",
+    [
+        b"", b"\xff", b"[]", b'{"other": []}', b'{"send": "C:\\\\a"}', b'{"send": [1]}',
+        b'{"unpair": 1}', b'{"send": [], "unpair": "x"}',
+    ],
 )
 def test_decode_rejects_malformed(data: bytes) -> None:
     with pytest.raises(ValueError):
@@ -44,14 +51,15 @@ def test_decode_rejects_malformed(data: bytes) -> None:
 
 def test_pipe_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pipe, "PIPE_NAME", rf"\\.\pipe\ClipBridgeTest-{threading.get_ident()}")
-    received: list[list[Path]] = []
+    received: list[pipe.Request] = []
     server = pipe.PipeServer(received.append)
     server.start()
     try:
         many = [tmp_path / f"{'n' * 200}-{i}.bin" for i in range(400)]  # > one pipe buffer
-        pipe.send_request([tmp_path / "one.txt"])
-        pipe.send_request(many)
-        assert received == [[tmp_path / "one.txt"], many]
+        pipe.send_request(pipe.Send([tmp_path / "one.txt"]))
+        pipe.send_request(pipe.Send(many))
+        pipe.send_request(pipe.Unpair("android-1"))
+        assert received == [pipe.Send([tmp_path / "one.txt"]), pipe.Send(many), pipe.Unpair("android-1")]
     finally:
         server.stop()
         server.join(5)
@@ -61,7 +69,7 @@ def test_pipe_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 def test_send_without_server_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pipe, "PIPE_NAME", r"\\.\pipe\ClipBridgeTest-nobody")
     with pytest.raises(pipe.ServerNotRunning):
-        pipe.send_request([Path("C:/x")])
+        pipe.send_request(pipe.Send([Path("C:/x")]))
 
 
 def test_send_cli_reports_rejected_paths_and_missing_server(
@@ -108,3 +116,52 @@ def test_firewall_rule_replaces_old_and_is_private_localsubnet_only() -> None:
     assert "delete rule" in delete and f'name="{install.FIREWALL_RULE}"' in delete
     assert "add rule" in add and "profile=private " in add and "remoteip=localsubnet" in add
     assert "public" not in args
+
+
+def test_unpair_cli_tells_running_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(pipe, "PIPE_NAME", rf"\\.\pipe\ClipBridgeTest-unpair-{threading.get_ident()}")
+    monkeypatch.setattr(config, "config_dir", lambda: tmp_path)
+    registry = config.DeviceRegistry()
+    registry.pair("android-1")
+    received: list[pipe.Request] = []
+    server = pipe.PipeServer(received.append)
+    server.start()
+    try:
+        assert main(["unpair", "android-1"]) == 0
+        assert main(["unpair", "android-1"]) == 1
+    finally:
+        server.stop()
+        server.join(5)
+    assert received == [pipe.Unpair("android-1")]
+    assert registry.load() == {}
+    assert "android-1: not paired" in capsys.readouterr().out
+
+
+def test_devices_cli_lists_paired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(config, "config_dir", lambda: tmp_path)
+    registry = config.DeviceRegistry()
+    registry.pair("android-1")
+    registry.pair("android-2")
+    registry.set_name("android-2", "Pixel 8")
+    assert main(["devices"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["android-1  (not connected yet)", "android-2  Pixel 8"]
+
+
+def test_unpair_cli_reports_pipe_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import pywintypes
+
+    def denied(request: pipe.Request) -> None:
+        raise pywintypes.error(5, "CreateFile", "Access is denied.")
+
+    monkeypatch.setattr(config, "config_dir", lambda: tmp_path)
+    monkeypatch.setattr(pipe, "send_request", denied)
+    config.DeviceRegistry().pair("android-1")
+    assert main(["unpair", "android-1"]) == 1
+    assert "key removed, live connections not dropped" in capsys.readouterr().out
+    assert config.DeviceRegistry().load() == {}

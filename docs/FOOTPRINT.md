@@ -12,7 +12,7 @@ listed here (see `CLAUDE.md`).
 | Firewall rule `ClipBridge` (inbound TCP 8765, Private profile, local subnet) | Windows Defender Firewall | `clipbridge uninstall` (one UAC prompt) |
 | Context-menu verb "Send to phone" | `HKCU\Software\Classes\*\shell\ClipBridge` | `clipbridge uninstall` |
 | SendTo shortcut "Phone (ClipBridge)" | `shell:sendto` (`%APPDATA%\Microsoft\Windows\SendTo`) | `clipbridge uninstall` |
-| Config + DPAPI-encrypted key | `%APPDATA%\ClipBridge` | `clipbridge uninstall --purge` |
+| Device registry (paired devices and their DPAPI-encrypted keys) | `%APPDATA%\ClipBridge` | `clipbridge uninstall --purge` |
 | Logs + unfinished transfers | `%LOCALAPPDATA%\ClipBridge` | `clipbridge uninstall --purge` |
 | Android build cache (only if you build the APK) | `%USERPROFILE%\.gradle` (shared with other Android projects) | delete manually if nothing else uses it |
 | **Your data**: received files, received clipboard images | `Downloads\ClipShare`, `Pictures\ClipBridge` | never deleted automatically |

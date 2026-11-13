@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 MAX_PLAINTEXT = 16 * 1024 * 1024
+LINK_CH = "link"  # `ch` of link-layer messages; every `ch` starting with it is reserved for the link
 
 
 class EnvelopeError(Exception):

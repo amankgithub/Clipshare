@@ -6,7 +6,6 @@ import asyncio
 import logging
 import logging.handlers
 import sys
-from pathlib import Path
 
 import pywintypes
 import win32api
@@ -18,9 +17,9 @@ from clipbridge.features.clipboard.feature import ClipboardFeature
 from clipbridge.features.clipboard.win32 import ClipboardThread
 from clipbridge.features.files.balloon import BalloonThread
 from clipbridge.features.files.feature import FilesFeature
-from clipbridge.features.files.pipe import PipeServer
 from clipbridge.link.discovery import Advertiser
 from clipbridge.link.server import DEFAULT_PORT, Link
+from clipbridge.pipe import PipeServer, Request, Send, Unpair
 
 MUTEX_NAME = "Local\\ClipBridge"
 log = logging.getLogger("clipbridge")
@@ -62,8 +61,7 @@ def is_running() -> bool:
 
 async def _run(port: int) -> None:
     loop = asyncio.get_running_loop()
-    psk = config.get_or_create_psk()
-    link = Link(psk, config.partial_dir(), port=port)
+    link = Link(config.DeviceRegistry(), config.partial_dir(), port=port)
     advertiser = Advertiser(port)
 
     clip_thread: ClipboardThread
@@ -85,15 +83,18 @@ async def _run(port: int) -> None:
     link.register(feature)
     link.register(files)
 
-    def on_send_request(paths: list[Path]) -> None:
-        for path in paths:
-            asyncio.run_coroutine_threadsafe(files.send(path), loop)
+    def on_pipe_request(request: Request) -> None:
+        if isinstance(request, Send):
+            for path in request.paths:
+                asyncio.run_coroutine_threadsafe(files.send(path), loop)
+        elif isinstance(request, Unpair):
+            asyncio.run_coroutine_threadsafe(link.revoke(request.device), loop)
 
     pipe_server: PipeServer | None = None
     try:
-        pipe_server = PipeServer(on_send_request)
+        pipe_server = PipeServer(on_pipe_request)
     except pywintypes.error:
-        log.exception("send pipe unavailable; Explorer 'Send to phone' will not work")
+        log.exception("CLI pipe unavailable; Explorer 'Send to phone' and live unpair will not work")
 
     await link.start()
     try:

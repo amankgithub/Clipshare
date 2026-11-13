@@ -33,6 +33,7 @@ def unique_path(directory: Path, name: str) -> Path:
 
 class FilesFeature:
     name = NAME
+    version = 1
 
     def __init__(
         self,
@@ -46,11 +47,11 @@ class FilesFeature:
 
     async def send(self, path: Path) -> bool:
         """Send a file to the connected phone; True once it confirms the file."""
-        peers = self._link.peers
-        if not peers:
-            log.info("no phone connected; not sending %s", path.name)
+        peer = next((p for p in self._link.peers if p.supports(NAME)), None)
+        if peer is None:
+            log.info("no phone with %s connected; not sending %s", NAME, path.name)
             return False
-        return await self._link.send_file(peers[0], NAME, path)
+        return await self._link.send_file(peer, NAME, path)
 
     async def on_file_offer(self, peer: Peer, offer: FileOffer) -> Path | None:
         directory = self._dest_dir or default_dest_dir()

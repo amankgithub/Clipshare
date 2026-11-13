@@ -16,9 +16,8 @@ from clipbridge.features.files.feature import FilesFeature, unique_path
 from clipbridge.link import transfer
 from clipbridge.link.server import Link
 from clipbridge.link.transfer_core import CHUNK, CompletedIds, Range, rewind_full
-from tclient import TestClient
+from tclient import PSK, MemoryDevices, TestClient, until_connected
 
-PSK = bytes(range(32))
 DATA = "clipbridge.data.v1"
 log = logging.getLogger(__name__)
 
@@ -32,14 +31,16 @@ class Env:
         self.link = self.make_link()
 
     def make_link(self) -> Link:
-        link = Link(PSK, self.partial, host="127.0.0.1", port=0)
+        link = Link(MemoryDevices("phone", "tablet"), self.partial, host="127.0.0.1", port=0)
         link.register(ClipboardFeature(link, self.clips.append))
         self.files = FilesFeature(link, dest_dir=self.dest, notify=self.received.append)
         link.register(self.files)
         return link
 
     async def phone(self, device: str = "phone") -> TestClient:
-        return await TestClient.connect(self.link.port, PSK, device)
+        client = await TestClient.connect(self.link.port, PSK, device)
+        await until_connected(self.link, device)
+        return client
 
     async def data(self, device: str = "phone") -> TestClient:
         return await TestClient.connect(self.link.port, PSK, device, DATA)

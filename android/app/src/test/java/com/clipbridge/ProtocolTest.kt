@@ -10,6 +10,12 @@ import com.clipbridge.link.Feature
 import com.clipbridge.link.FeatureRouter
 import com.clipbridge.link.FrameCipher
 import com.clipbridge.link.FrameException
+import com.clipbridge.link.Hello
+import com.clipbridge.link.Reply
+import com.clipbridge.link.Requests
+import com.clipbridge.link.Response
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import com.clipbridge.link.Peer
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
@@ -62,6 +68,45 @@ class ProtocolTest {
         }
     }
 
+    /** Envelopes of the vector frames whose header has `type` == [type]. */
+    private fun vectorEnvelopes(type: String) = (0 until v.getJSONArray("frames").length())
+        .map { v.getJSONArray("frames").getJSONObject(it) }
+        .filter { it.getJSONObject("header").optString("type") == type }
+        .map { Envelopes.parse(hex(it.getString("plaintext"))) }
+
+    @Test fun helloFrames() {
+        val hellos = vectorEnvelopes("hello")
+        assertEquals(2, hellos.size)
+        for (e in hellos) {
+            val hello = Hello.parse(e.header, e.body)!!
+            assertTrue(hello.name.isNotEmpty())
+            assertTrue(hello.features.isNotEmpty())
+            // Our own hello for the same content round-trips through the parser.
+            val again = Hello.parse(Envelopes.parse(Envelopes.encode(hello.header())).header, ByteArray(0))!!
+            assertEquals(hello.name, again.name)
+            assertEquals(hello.features, again.features)
+        }
+    }
+
+    @Test fun replyFrames() {
+        val replies = vectorEnvelopes("reply")
+        assertEquals(2, replies.size)
+        val scope = CoroutineScope(Dispatchers.Default)
+        val got = ArrayList<Response?>()
+        for (e in replies) {
+            val r = Requests(scope)
+            val mid = r.track { got += it }
+            e.header.put("mid", mid) // the vector's mid belongs to the vector's sender
+            r.onControl(e.header, e.body)
+        }
+        assertEquals(2, got.size)
+        assertTrue(got.all { it!!.ok })
+        val empty = got.first { it!!.data == null }!!
+        assertEquals(0, empty.body.size)
+        val withData = got.first { it!!.data != null }!!
+        assertEquals(8, withData.body.size)
+    }
+
     @Test fun frameRejections() {
         val key = h("key_c2s")
         val good = Crypto.encryptFrame(key, 0, "x".toByteArray())
@@ -106,9 +151,10 @@ class ProtocolTest {
         val r = FeatureRouter { logs.add(it) }
         r.register(object : Feature {
             override val name = "a"
+            override val version = 1
             override fun onPeerConnected(peer: Peer) {}
             override fun onPeerDisconnected(peer: Peer) {}
-            override fun onMessage(peer: Peer, header: JSONObject, body: ByteArray) { got.add(header.getString("k")) }
+            override fun onMessage(peer: Peer, header: JSONObject, body: ByteArray): Reply? { got.add(header.getString("k")); return null }
         })
         r.dispatch(Peer("p"), Envelopes.encode(JSONObject().put("ch", "a").put("k", "1")))
         r.dispatch(Peer("p"), Envelopes.encode(JSONObject().put("ch", "zzz").put("k", "2")))

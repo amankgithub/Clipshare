@@ -134,7 +134,7 @@ object TransferCore {
 
     // -- control and data messages ---------------------------------------------------------------
 
-    private fun link(type: String): JSONObject = JSONObject().put("ch", Receipts.LINK_CH).put("type", type)
+    private fun link(type: String): JSONObject = JSONObject().put("ch", LINK_CH).put("type", type)
 
     fun accept(id: String, ranges: List<Range>): JSONObject = link("xfer_accept").put("id", id).put("ranges", rangesJson(ranges))
     fun reject(id: String): JSONObject = link("xfer_reject").put("id", id)
@@ -146,7 +146,7 @@ object TransferCore {
 
     /** Frame type received on a data connection mid-range: "data", "end", or throws. */
     fun classify(h: JSONObject): String {
-        if (h.optString("ch") == Receipts.LINK_CH) when (h.optString("type")) {
+        if (h.optString("ch") == LINK_CH) when (h.optString("type")) {
             "xfer_data" -> return "data"
             "xfer_end" -> return "end"
         }

@@ -46,6 +46,7 @@ def save_png(directory: Path, png: bytes, now: datetime | None = None) -> Path:
 
 class ClipboardFeature:
     name = "clipboard"
+    version = 1
 
     def __init__(
         self,
@@ -95,7 +96,8 @@ class ClipboardFeature:
         if self._too_big(clip):
             log.warning("local image too large, skipped (len=%d)", len(clip.data))
             return
-        to_send = self._engine.on_local(clip, connected=bool(self._link.peers))
+        connected = any(p.supports(self.name) for p in self._link.peers)
+        to_send = self._engine.on_local(clip, connected=connected)
         if to_send is None:
             log.debug("local %s clip dropped/queued (len=%d)", clip.kind, len(clip.data))
             return
@@ -106,6 +108,8 @@ class ClipboardFeature:
         await self._send_all(to_send)
 
     async def on_peer_connected(self, peer: Peer) -> None:
+        if not peer.supports(self.name):
+            return
         pending = self._engine.take_pending()
         if pending is not None:
             header, body = self._wire(pending)

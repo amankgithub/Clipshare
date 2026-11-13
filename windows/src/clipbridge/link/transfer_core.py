@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from clipbridge.link.receipts import LINK_CH
+from clipbridge.link.envelope import LINK_CH
 
 STREAMS = 1  # data connections per transfer; raised only if the benchmark shows a gain
 CHUNK = 4 * 1024 * 1024  # max xfer_data body

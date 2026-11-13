@@ -251,6 +251,6 @@ def status() -> int:
     print(f"context menu:  {'present' if _verb_present() else 'missing'}")
     shortcut = shortcut_spec(pythonw_path(), _sendto_dir()).path
     print(f"SendTo:        {'present' if shortcut.exists() else 'missing'}")
-    print(f"PSK:           {'configured' if config.load_psk() else 'not generated (run pair)'}")
+    print(f"devices:       {len(config.DeviceRegistry().load()) or 'none (run pair)'}")
     print(f"log:           {config.log_dir() / 'clipbridge.log'}")
     return 0

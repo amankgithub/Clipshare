@@ -11,11 +11,12 @@ Features on that link: clipboard sync and file transfer (`files`). Full plan: `d
 
 ## Layering rule (most important)
 - **Link layer**: discovery, connect/reconnect, handshake, crypto, liveness, peer registry, and general
-  services: delivery receipts, file transfer (data connections). Knows nothing about features.
+  services: device registry (per-device keys), `hello` (peer name, features, versions), request/reply
+  (delivery receipts are the empty reply), file transfer (data connections). Knows nothing about features.
 - **Feature layer**: one module per feature (`name`, `on_peer_connected`, `on_peer_disconnected`, `on_message(peer, header, body)`), uses `send(peer|all, header, body)`;
   features that take files add `on_file_offer` / `on_file_received` and use `send_file`.
 - Link routes by `header.ch`. Never put feature code or feature names inside the link layer. A new feature = new module + one register line per side.
-- Generic needs (delivery receipts, request/response, file transfer, ...) belong in the link layer as
+- Generic needs (request/reply, file transfer, ...) belong in the link layer as
   general services any feature can use, never as one feature's special case.
 
 ## Adding or changing a feature

@@ -1,8 +1,9 @@
-r"""Send entry point: `clipbridge send <files>` hands paths to the running server over `\\.\pipe\ClipBridge`.
+r"""CLI-to-server commands over `\\.\pipe\ClipBridge`: `clipbridge send` and `clipbridge unpair`.
 
-One request per client connection: a UTF-8 JSON message `{"send": ["<absolute path>", ...]}`,
-answered with a one-byte ack once the server has queued the paths. The pipe is local only
-(remote clients rejected) and its DACL admits only the user the server runs as.
+One request per client connection: a UTF-8 JSON message, either `{"send": ["<absolute path>", ...]}`
+(queue files for the phone) or `{"unpair": "<device>"}` (drop that device's live connections),
+answered with a one-byte ack once the server has taken it. The pipe is local only (remote clients
+rejected) and its DACL admits only the user the server runs as.
 """
 
 from __future__ import annotations
@@ -12,7 +13,8 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from dataclasses import dataclass
+from typing import Any, Callable, Sequence, Union
 
 import pywintypes
 import win32api
@@ -53,25 +55,44 @@ def validate_paths(args: Sequence[str], cwd: Path) -> tuple[list[Path], list[str
     return files, errors
 
 
-def encode_request(paths: Sequence[Path]) -> bytes:
-    return json.dumps({"send": [str(p) for p in paths]}).encode("utf-8")
+@dataclass(frozen=True)
+class Send:
+    paths: list[Path]
 
 
-def decode_request(data: bytes) -> list[Path]:
-    """Paths of a request; ValueError if it is malformed."""
+@dataclass(frozen=True)
+class Unpair:
+    device: str
+
+
+Request = Union[Send, Unpair]
+
+
+def encode_request(request: Request) -> bytes:
+    if isinstance(request, Send):
+        return json.dumps({"send": [str(p) for p in request.paths]}).encode("utf-8")
+    return json.dumps({"unpair": request.device}).encode("utf-8")
+
+
+def decode_request(data: bytes) -> Request:
+    """The request; ValueError if it is malformed."""
     try:
         message = json.loads(data.decode("utf-8"))
-        paths = message["send"]
-    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as e:
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
         raise ValueError("malformed request") from e
-    if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+    if not isinstance(message, dict) or len(message) != 1:
         raise ValueError("malformed request")
-    return [Path(p) for p in paths]
+    paths, device = message.get("send"), message.get("unpair")
+    if isinstance(paths, list) and all(isinstance(p, str) for p in paths):
+        return Send([Path(p) for p in paths])
+    if isinstance(device, str):
+        return Unpair(device)
+    raise ValueError("malformed request")
 
 
 # -- client ----------------------------------------------------------------
-def send_request(paths: Sequence[Path]) -> None:
-    """Hand `paths` to the server; raises ServerNotRunning if nothing listens."""
+def send_request(request: Request) -> None:
+    """Hand `request` to the server; raises ServerNotRunning if nothing listens."""
     deadline = time.monotonic() + CONNECT_TIMEOUT_MS / 1000
     while True:
         try:
@@ -90,7 +111,7 @@ def send_request(paths: Sequence[Path]) -> None:
                 pass
     try:
         win32pipe.SetNamedPipeHandleState(handle, win32pipe.PIPE_READMODE_MESSAGE, None, None)
-        win32file.WriteFile(handle, encode_request(paths))
+        win32file.WriteFile(handle, encode_request(request))
         win32file.ReadFile(handle, 1)
     finally:
         win32file.CloseHandle(handle)
@@ -120,11 +141,11 @@ def _read_message(handle: Any) -> bytes:
 
 
 class PipeServer(threading.Thread):
-    """Accepts send requests and passes each request's files to `on_paths` (called on this thread)."""
+    """Accepts requests and passes each one to `on_request` (called on this thread)."""
 
-    def __init__(self, on_paths: Callable[[list[Path]], None]) -> None:
-        super().__init__(name="files-pipe", daemon=True)
-        self._on_paths = on_paths
+    def __init__(self, on_request: Callable[[Request], None]) -> None:
+        super().__init__(name="pipe", daemon=True)
+        self._on_request = on_request
         self._stopping = False
         self._attributes = _current_user_attributes()
         self._first = self._create(first=True)  # fails now if another process owns the name
@@ -165,23 +186,22 @@ class PipeServer(threading.Thread):
             try:
                 current, handle = handle, self._create()  # keep one instance listening
             except pywintypes.error:
-                log.exception("creating pipe instance failed; send requests disabled")
+                log.exception("creating pipe instance failed; CLI requests disabled")
                 win32file.CloseHandle(handle)
                 return
             self._serve(current)
 
     def _serve(self, handle: Any) -> None:
         try:
-            paths = decode_request(_read_message(handle))
-            self._on_paths(paths)
+            self._on_request(decode_request(_read_message(handle)))
             win32file.WriteFile(handle, ACK)
             win32file.FlushFileBuffers(handle)  # wait for the client to read the ack
         except ValueError:
-            log.warning("ignoring malformed send request")
+            log.warning("ignoring malformed pipe request")
         except pywintypes.error as e:
-            log.warning("send request failed: %s", e.strerror)
+            log.warning("pipe request failed: %s", e.strerror)
         except Exception:
-            log.exception("send request failed")
+            log.exception("pipe request failed")
         finally:
             try:
                 win32pipe.DisconnectNamedPipe(handle)

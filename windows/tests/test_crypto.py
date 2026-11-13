@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from clipbridge.link import crypto, envelope
+from clipbridge.link import crypto, envelope, hello, requests
 
 VECTORS = json.loads((Path(__file__).parents[2] / "protocol" / "test_vectors.json").read_text("utf-8"))
 H = bytes.fromhex
@@ -52,3 +52,26 @@ def test_channel_counters() -> None:
     assert b.decrypt(f0) == b"one" and b.decrypt(f1) == b"two"
     with pytest.raises(crypto.FrameError):
         b.decrypt(f0)  # replay
+
+
+def _frame(direction: str, type_: str) -> dict:
+    return next(f for f in VECTORS["frames"] if f["direction"] == direction and f["header"].get("type") == type_)
+
+
+@pytest.mark.parametrize("direction", ["s2c", "c2s"])
+def test_hello_vectors_parse(direction: str) -> None:
+    frame = _frame(direction, "hello")
+    assert frame["counter"] == 0  # hello is the first frame each side sends
+    parsed = hello.parse(frame["header"])
+    assert parsed is not None
+    assert parsed.name == frame["header"]["name"] and parsed.features == frame["header"]["features"]
+
+
+@pytest.mark.parametrize("direction", ["s2c", "c2s"])
+def test_reply_vectors_round_trip(direction: str) -> None:
+    frame = _frame(direction, "reply")
+    header, body = frame["header"], H(frame["body"])
+    mid, reply = requests.parse_reply(header, body)
+    assert mid == header["mid"] and reply.ok and reply.body == body
+    answer = requests.Answer(reply.data, reply.body) if reply.data or reply.body else None
+    assert requests.reply(mid, True, answer) == (header, body)

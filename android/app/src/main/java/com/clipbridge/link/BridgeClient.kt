@@ -17,13 +17,14 @@ enum class LinkState { NOT_PAIRED, SEARCHING, CONNECTING, CONNECTED }
 data class Status(val state: LinkState, val detail: String = "")
 
 /**
- * Client side of the link: connect loop over the control connection, routing by `ch`, delivery
- * receipts and file transfer. Knows nothing about features; they register on [router] and send via [LinkSender].
+ * Client side of the link: connect loop over the control connection, `hello` exchange, routing by
+ * `ch`, requests/replies and file transfer. Knows nothing about features; they register on
+ * [router] and send via [LinkSender].
  */
 class BridgeClient(
     private val scope: CoroutineScope,
-    private val deviceId: String,
-    private val pskProvider: () -> ByteArray?,
+    private val pairingProvider: () -> Pairing?,
+    private val deviceName: String,
     private val endpointsProvider: () -> List<Endpoint>,
     private val router: FeatureRouter,
     private val onGoodEndpoint: (Endpoint) -> Unit,
@@ -41,13 +42,15 @@ class BridgeClient(
     private val _status = MutableStateFlow(Status(LinkState.SEARCHING))
     val status: StateFlow<Status> = _status
 
-    private val receipts = Receipts(scope)
+    private val requests = Requests(scope)
     private val transfer = Transfer(
-        parent = scope, http = http, deviceId = deviceId, router = router, store = partials,
-        control = { send(PEER, it) }, dropLink = { networkLost() }, onBusy = onTransferBusy, log = log,
+        parent = scope, http = http, router = router, store = partials,
+        control = { sendEnvelope(it) }, dropLink = { networkLost() }, onBusy = onTransferBusy, log = log,
     )
     private val wake = Channel<Unit>(Channel.CONFLATED)
     @Volatile private var session: SecureSocket? = null
+    /** The server, once its `hello` arrived on the current connection; null otherwise. */
+    @Volatile private var peer: Peer? = null
     private var job: Job? = null
 
     fun start() {
@@ -63,21 +66,18 @@ class BridgeClient(
     /** New network / new endpoint / new settings: retry now. */
     fun retryNow() { wake.trySend(Unit) }
 
-    /** Settings changed (PSK/host): drop the current connection and reconnect. */
+    /** Settings changed (pairing/host): drop the current connection and reconnect. */
     fun reconnect() { session?.close(1000); retryNow() }
 
     /** Network gone: the socket is dead even if TCP has not noticed yet. */
     fun networkLost() { session?.cancel() }
 
-    override fun send(peer: Peer?, header: JSONObject, body: ByteArray, onDelivered: ((Boolean) -> Unit)?): Boolean {
-        // Track before sending: the ack can arrive before send returns.
-        val mid = onDelivered?.let { receipts.track(it) }
+    override fun send(peer: Peer?, header: JSONObject, body: ByteArray, onReply: ((Response?) -> Unit)?): Boolean {
+        // Track before sending: the reply can arrive before send returns.
+        val mid = onReply?.let { requests.track(it) }
         val h = if (mid == null) header else JSONObject(header.toString()).put("mid", mid)
-        val plaintext = Envelopes.encode(h, body)
-        val sent = if (plaintext.size > Envelopes.MAX_PLAINTEXT) {
-            log("skip oversize envelope"); false
-        } else session?.send(plaintext) ?: false
-        if (!sent && mid != null) receipts.resolve(mid, false)
+        val sent = this.peer != null && sendEnvelope(h, body)
+        if (!sent && mid != null) requests.resolve(mid, null)
         return sent
     }
 
@@ -86,19 +86,26 @@ class BridgeClient(
         onProgress: (Long) -> Unit, onDone: (Boolean) -> Unit,
     ) = transfer.sendFile(peer, feature, source, meta, onProgress, onDone)
 
+    /** Encrypts one envelope onto the control connection. @return false if not connected or too big. */
+    private fun sendEnvelope(header: JSONObject, body: ByteArray = ByteArray(0)): Boolean {
+        val plaintext = Envelopes.encode(header, body)
+        if (plaintext.size > Envelopes.MAX_PLAINTEXT) { log("skip oversize envelope"); return false }
+        return session?.send(plaintext) ?: false
+    }
+
     private suspend fun loop() {
         val backoff = Backoff()
         while (scope.isActive) {
-            val psk = pskProvider()
+            val pairing = pairingProvider()
             val eps = endpointsProvider()
             var ok = false
-            if (psk == null) {
+            if (pairing == null) {
                 _status.value = Status(LinkState.NOT_PAIRED)
             } else if (eps.isEmpty()) {
                 _status.value = Status(LinkState.SEARCHING, "no endpoint")
             } else {
                 for (ep in eps) {
-                    if (connectOnce(psk, ep)) { ok = true; break }
+                    if (connectOnce(pairing, ep)) { ok = true; break }
                 }
                 if (!ok) _status.value = Status(LinkState.SEARCHING, "unreachable")
             }
@@ -108,9 +115,12 @@ class BridgeClient(
     }
 
     /** Runs one connection to its end. @return true if the handshake succeeded. */
-    private suspend fun connectOnce(psk: ByteArray, ep: Endpoint): Boolean {
+    private suspend fun connectOnce(pairing: Pairing, ep: Endpoint): Boolean {
         _status.value = Status(LinkState.CONNECTING, ep.toString())
-        val s = SecureSocket(scope, psk, deviceId, ep, SUBPROTOCOL, onReady = { onReady(it, psk) }, onPlaintext = { _, p -> onPlaintext(p) }, log = log)
+        val s = SecureSocket(
+            scope, pairing, ep, SUBPROTOCOL,
+            onReady = { onReady(it) }, onPlaintext = { sock, p -> onPlaintext(sock, pairing, p) }, log = log,
+        )
         session = s
         try {
             s.open(http)
@@ -120,32 +130,59 @@ class BridgeClient(
         }
         val authed = s.closed.await()
         session = null
-        receipts.failAll()
-        if (authed) {
+        val p = peer
+        peer = null
+        requests.failAll()
+        if (p != null) {
             transfer.onLinkDown()
-            router.peerDisconnected(PEER)
-            _status.value = Status(LinkState.SEARCHING, "disconnected")
+            router.peerDisconnected(p)
         }
+        if (authed) _status.value = Status(LinkState.SEARCHING, "disconnected")
         return authed
     }
 
-    private fun onReady(s: SecureSocket, psk: ByteArray) {
+    /** Server MAC checked out: our `hello` is the first frame (PROTOCOL.md 6.1). */
+    private fun onReady(s: SecureSocket) {
         onGoodEndpoint(s.endpoint)
-        _status.value = Status(LinkState.CONNECTED, s.endpoint.toString())
-        transfer.onLinkUp(PEER, psk, s.endpoint)
-        router.peerConnected(PEER)
+        if (!s.send(Envelopes.encode(Hello(deviceName, router.versions()).header()))) s.close(1000)
     }
 
-    private fun onPlaintext(plaintext: ByteArray) {
-        when (val r = router.dispatch(PEER, plaintext)) {
-            is Routed.Handled -> r.mid?.let { send(PEER, Receipts.ack(it)) }
-            is Routed.LinkControl -> { receipts.onControl(r.header); transfer.onControl(PEER, r.header) }
-            Routed.Dropped -> {}
+    private fun onPlaintext(s: SecureSocket, pairing: Pairing, plaintext: ByteArray) {
+        val p = peer ?: return onFirstFrame(s, pairing, plaintext)
+        when (val r = router.dispatch(p, plaintext)) {
+            is Routed.Answer -> answer(r)
+            is Routed.LinkControl -> when {
+                Hello.isHello(r.header) -> s.close(4400) // a second hello
+                r.header.optString("type") == Requests.TYPE -> requests.onControl(r.header, r.body)
+                else -> transfer.onControl(p, r.header)
+            }
+            Routed.Done -> {}
+        }
+    }
+
+    /** The server's first frame must be a valid `hello`; then the peer exists for features. */
+    private fun onFirstFrame(s: SecureSocket, pairing: Pairing, plaintext: ByteArray) {
+        val env = try { Envelopes.parse(plaintext) } catch (e: EnvelopeException) { null }
+        val hello = env?.let { Hello.parse(it.header, it.body) }
+        if (hello == null) { log("invalid hello"); return s.close(4400) }
+        val p = Peer(PEER.id, hello.name, hello.features)
+        peer = p
+        _status.value = Status(LinkState.CONNECTED, s.endpoint.toString())
+        transfer.onLinkUp(p, pairing, s.endpoint)
+        router.peerConnected(p)
+    }
+
+    /** Replies to a request; reply content over the size limit means the feature failed (PROTOCOL.md 6.2). */
+    private fun answer(r: Routed.Answer) {
+        val res = r.response
+        if (!sendEnvelope(Requests.replyHeader(r.mid, res), res.body) && res.ok) {
+            sendEnvelope(Requests.replyHeader(r.mid, Response.FAILED))
         }
     }
 
     companion object {
         const val SUBPROTOCOL = "clipbridge.v1"
+        /** The server, for sends queued before it connects; equal to the connected peer (by id). */
         val PEER = Peer("server")
     }
 }

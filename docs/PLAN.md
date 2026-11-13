@@ -24,15 +24,17 @@ Laptop = WebSocket server (`0.0.0.0:8765`), advertises `_clipbridge._tcp.local.`
 
 ### Two layers: Link vs Features (the expansion point)
 The project is really a **general secure device link**; clipboard is just the first feature on it.
-- **Link layer** (written once, never touched by features): discovery, connect/reconnect, handshake, encryption, liveness, peer registry, and general services any feature can use: delivery receipts and file transfer. After handshake the link is symmetric — features don't know or care which side is server.
+- **Link layer** (written once, never touched by features): discovery, connect/reconnect, handshake, encryption, liveness, device registry (one key per paired device), peer registry with each peer's `hello` (name, features and versions), and general services any feature can use: request/reply (a delivery receipt is the empty reply) and file transfer. After handshake the link is symmetric — features don't know or care which side is server.
 - **Feature layer**: each feature = one module implementing a tiny interface, registered by name:
   ```
-  Feature { name: str
+  Feature { name: str, version: int                       (sent in hello)
             on_peer_connected(peer) / on_peer_disconnected(peer)
             on_message(peer, header: dict, body: bytes)
             on_file_offer(peer, offer) -> destination | None     (only features that take files)
             on_file_received(peer, offer, path) }
-  Link gives each feature: send(peer|all, header, body=b"")
+  Link gives each feature: send(peer|all, header, body=b"")   (all = peers whose hello lists the feature)
+                           request(peer, header, body) -> reply | None
+                           peer.supports(name, version)
                            send_file(peer, feature, file, meta) -> delivered | failed
   ```
   Link routes by `header.ch` (= feature name). Unknown `ch` → ignored + debug log, so either side can be upgraded first.
@@ -43,15 +45,16 @@ The project is really a **general secure device link**; clipboard is just the fi
 ### Protocol (single source of truth: `protocol/PROTOCOL.md` + `protocol/test_vectors.json`)
 1. Client connects `ws://host:8765`, subprotocol `clipbridge.v1`.
 2. Server → `{"type":"challenge","v":1,"sn":b64(16B)}` (plaintext).
-3. Client → `{"type":"auth","cn":b64(16B),"device":"<id>","mac":b64(HMAC-SHA256(PSK,"c"‖sn‖cn‖device))}`.
+3. Client → `{"type":"auth","cn":b64(16B),"device":"<id>","mac":b64(HMAC-SHA256(PSK,"c"‖sn‖cn‖device))}`. PSK = that device's own key, issued at pairing; the server looks it up in its device registry (unknown device → 4401).
 4. Server verifies (constant-time) → `{"type":"auth_ok","mac":b64(HMAC(PSK,"s"‖sn‖cn))}`; client verifies → server proven genuine. Failure = close 4401, no detail.
 5. Keys: `HKDF-SHA256(PSK, salt=sn‖cn, info="c2s"|"s2c")` → 2×32B.
 6. Every later frame: binary `nonce(12B = u64 counter LE ‖ 4×0) ‖ AES-GCM(ct)`. Receiver requires counter strictly increasing; any decrypt/counter failure closes connection.
 7. Decrypted plaintext = envelope: `u32 header_len (BE) ‖ header JSON (UTF-8) ‖ body bytes`.
-   Header: `{"ch":"clipboard","type":"clip","kind":"text","data":"…","ts":<ms>}` (text inline in header; binary in body). Unknown `ch`/`type`/`kind` ignored (forward compat). Max frame 16 MiB (room for images); oversize skipped + logged. Anything bigger goes through file transfer (item 10).
-8. Liveness: server ping 10s/timeout 10s; client (OkHttp) ping 15s. Client backoff capped at 10s so PC resume reconnects fast.
-9. Delivery receipts (link service, any feature): sender adds `"mid"` to a header; receiver's link replies `{"ch":"link","type":"ack","mid":…}` once the feature handled it. No receipt within 10s or link lost = not delivered. Used by explicit image sends (screenshot tile, share target) to confirm the PC really got the image.
-10. File transfer (link service, any feature; PROTOCOL.md 6.2): offer / accept-with-ranges / done on the control connection; bytes on separate **data connections** (subprotocol `clipbridge.data.v1`, same handshake), always dialed by the phone, so a 2 GB file never delays a clip. Resume = receiver reports how many bytes of each range it already has (tus idea); each range ends with its SHA-256 and the receiver renames `.part` to the final name only after every hash matches (Syncthing idea). One data connection carries many files back to back (LocalSend session idea).
+   Header: `{"ch":"clipboard","type":"clip","kind":"text","data":"…","ts":<ms>}` (text inline in header; binary in body). Unknown `ch`/`type`/`kind` ignored (forward compat). Max frame 16 MiB (room for images); oversize skipped + logged. Anything bigger goes through file transfer (item 11).
+8. Hello (PROTOCOL.md 6.1): each side's first encrypted frame on the control connection is `{"ch":"link","type":"hello","name":…,"features":{name: version}}`. Features see a peer only after its hello; `peer.supports(name, version)` lets the UI hide what the peer cannot do; the server relays a feature's messages only to peers that list it.
+9. Liveness: server ping 10s/timeout 10s; client (OkHttp) ping 15s. Client backoff capped at 10s so PC resume reconnects fast.
+10. Requests and replies (link service, any feature; PROTOCOL.md 6.2): sender adds `"mid"` to a header; receiver's link answers `{"ch":"link","type":"reply","mid":…,"ok":true}` plus optional `data` and body returned by the feature, or `ok:false` if no feature took it or the feature failed. No reply within 10s or link lost = not delivered. A delivery receipt is the empty reply, used by explicit image sends (screenshot tile, share target) to confirm the PC really got the image.
+11. File transfer (link service, any feature; PROTOCOL.md 6.3): offer / accept-with-ranges / done on the control connection; bytes on separate **data connections** (subprotocol `clipbridge.data.v1`, same handshake), always dialed by the phone, so a 2 GB file never delays a clip. Resume = receiver reports how many bytes of each range it already has (tus idea); each range ends with its SHA-256 and the receiver renames `.part` to the final name only after every hash matches (Syncthing idea). One data connection carries many files back to back (LocalSend session idea).
 
 ### File transfer design
 - **Queue**: sender keeps an in-memory FIFO of files (id → path/URI). Unfinished items are re-offered with the same `id` after a reconnect. Up to `STREAMS` data connections at once per direction (sending never waits behind a large file being received); separate files run in parallel and one large file is split into up to `STREAMS` ranges written at their offsets into a preallocated `.part` (aria2/IDM segmented download). `STREAMS` is 1: on the vivo over 5 GHz, three raw TCP streams together were slower than one (13.6 vs 16.1 MB/s), so the range-splitting path stays unused unless a future benchmark shows a gain.
@@ -79,8 +82,9 @@ Deps: `websockets`, `zeroconf`, `pywin32`, `cryptography`. Dev: `pytest`, `pytes
 ```
 windows/pyproject.toml
 windows/src/clipbridge/
-  __main__.py     CLI: run | pair | send | install | uninstall [--purge] | status
-  config.py       %APPDATA%\ClipBridge\config.json; PSK stored DPAPI-encrypted (win32crypt)
+  __main__.py     CLI: run | pair | devices | unpair <device> | send | install | uninstall [--purge] | status
+  config.py       device registry %APPDATA%\ClipBridge\devices.bin: {device: psk, name}, DPAPI-encrypted (win32crypt)
+  pipe.py         named pipe \.\pipe\ClipBridge: CLI → running server (send files, unpair)
   protocol.py     message dataclasses, encode/decode, size limits
   crypto.py       handshake MACs, HKDF, SecureChannel(encrypt/decrypt, counters)
   sync.py         SyncEngine (pure)
@@ -93,7 +97,8 @@ windows/src/clipbridge/
                   named mutex `Local\ClipBridge`, rotating file log %LOCALAPPDATA%\ClipBridge\logs
 windows/tests/    test_crypto (vectors), test_sync, test_protocol, test_server (in-process handshake + echo/relay)
 ```
-- `pair`: generate PSK if absent → push to phone via `adb shell am start -n <pkg>/.ui.PairActivity --es psk <b64> --es host <ip>`; also prints key for manual paste.
+- `pair`: assign a new device id (`android-<8 hex>`) and its own 32-byte PSK, add both to the registry → push to phone via `adb shell am start -n <pkg>/.ui.PairActivity --es device <id> --es psk <b64> --es host <ip>`; also prints the pairing code `<device>:<psk b64>` for manual paste. Pairing again gives a new device and key.
+- `devices` lists paired devices (id, hello name). `unpair <device>` deletes its key and tells the running server over the pipe to close its connections (4401); a lost phone is revoked alone.
 - `install`: register Task Scheduler task from XML via `schtasks /Create /XML`: triggers Logon + SessionUnlock (current user), InteractiveToken (must be user session — clipboard is per-desktop, SYSTEM/session 0 can't see it), `IgnoreNew`, restart every 1 min ×999, no time limit, run on battery. Action: `pythonw.exe -m clipbridge run`. Adds firewall inbound rule for TCP 8765 (Private profile, local subnet only, needs one UAC prompt; on a network Windows marks Public, switch it to Private once and Windows remembers it), the "Send to phone" context-menu verb and the SendTo shortcut (both HKCU / per-user, no UAC). `uninstall` reverses all of them; `uninstall --purge` also deletes `%APPDATA%\ClipBridge` and `%LOCALAPPDATA%\ClipBridge`. Received files are never deleted. Everything ClipBridge leaves on either device is listed in `docs/FOOTPRINT.md`.
 - Never exits on network errors; only fatal init errors exit non-zero (→ Task Scheduler restarts).
 
@@ -103,7 +108,7 @@ Package: `com.clipbridge` (personal sideload).
 ```
 app/src/main/java/com/clipbridge/
   ClipBridgeApp.kt
-  data/Settings.kt            PSK, device id, last good host:port, manual host (SharedPreferences, app-private)
+  data/Settings.kt            pairing (device id + PSK, both assigned by the PC), last good host:port, manual host (SharedPreferences, app-private)
   protocol/Messages.kt        @Serializable messages
   crypto/Handshake.kt, crypto/SecureChannel.kt
   sync/SyncEngine.kt          same rules as Python
@@ -116,7 +121,7 @@ app/src/main/java/com/clipbridge/
   clipboard/ClipReadActivity.kt    transparent, no animation; onWindowFocusChanged(true) → read clip → hand to service → finish()
   service/BridgeService.kt    FGS type connectedDevice, silent low-importance channel; owns client+engine+trigger
   service/BootReceiver.kt     BOOT_COMPLETED, MY_PACKAGE_REPLACED → startForegroundService
-  ui/MainActivity.kt          status, host override, PSK paste, permission checklist (battery exemption, overlay, READ_LOGS, notifications) with fix buttons
+  ui/MainActivity.kt          status, host override, pairing-code paste, permission checklist (battery exemption, overlay, READ_LOGS, notifications) with fix buttons
   ui/PairActivity.kt          exported but `android:permission="android.permission.DUMP"` → only adb shell can invoke
   ui/SendClipboardTile.kt     Quick Settings tile → ClipReadActivity (manual fallback)
   ui/ShareTargetActivity.kt   ACTION_SEND text/plain → send (manual fallback)
@@ -125,10 +130,10 @@ app/src/test/                 crypto vectors, SyncEngine, protocol
 Permissions: INTERNET, ACCESS_NETWORK_STATE, CHANGE_NETWORK_STATE (connectedDevice prerequisite), FOREGROUND_SERVICE(+_CONNECTED_DEVICE), POST_NOTIFICATIONS, RECEIVE_BOOT_COMPLETED, REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, SYSTEM_ALERT_WINDOW, READ_LOGS (adb-granted).
 Setup script `android/setup.ps1`: build+install APK, `pm grant READ_LOGS`, `appops set SYSTEM_ALERT_WINDOW allow`, `dumpsys deviceidle whitelist +com.clipbridge`, then `clipbridge pair`. README lists vivo manual steps (Background power → allow high usage; Auto-start on; lock in recents).
 
-Code layout follows the layers on both sides: `link/` (transport, crypto, discovery, peers, receipts, transfer) and one package per feature: `features/clipboard/` (SyncEngine, platform clipboard I/O), `features/files/` (destination, notifications, send entry points). Python: `link/` + `features/` subpackages under `clipbridge/`; Kotlin: `com.clipbridge.link.*` + `com.clipbridge.features.<name>.*`. File transfer splits pure range/resume logic (unit-tested) from the socket and disk I/O.
+Code layout follows the layers on both sides: `link/` (transport, crypto, discovery, peers, hello, requests, transfer) and one package per feature: `features/clipboard/` (SyncEngine, platform clipboard I/O), `features/files/` (destination, notifications, send entry points). Python: `link/` + `features/` subpackages under `clipbridge/`; Kotlin: `com.clipbridge.link.*` + `com.clipbridge.features.<name>.*`. File transfer splits pure range/resume logic (unit-tested) from the socket and disk I/O.
 
 ## Target layering (before the next features)
-`link/` today holds transport, crypto, routing, receipts and file transfer, and OS glue sits inside features (the Windows clipboard thread and tray balloon, the named pipe, `ShareTargetActivity` routing to two features). The next features (hotspot, input sharing, second display, phone mirroring) reuse each other's parts, so both sides move to five layers with the same names:
+`link/` today holds transport, crypto, routing, hello, requests and file transfer, and OS glue sits inside features (the Windows clipboard thread and tray balloon, `ShareTargetActivity` routing to two features). The next features (hotspot, input sharing, second display, phone mirroring) reuse each other's parts, so both sides move to five layers with the same names:
 
 | Layer | Holds | Rule |
 |---|---|---|
@@ -215,7 +220,7 @@ On the extender, Wi-Fi stalls of 10–20 s drop the link; the transfer reconnect
 3. Android app: crypto/protocol/sync + tests against vectors → client/service → clipboard trigger (per spike) → fallbacks → UI.
 4. Persistence: Task Scheduler + firewall install; boot receiver; setup script.
 5. End-to-end + soak.
-6. File transfer spec: `PROTOCOL.md` 6.2, this plan, `CLAUDE.md`, `docs/FOOTPRINT.md`.
+6. File transfer spec: `PROTOCOL.md` 6.3, this plan, `CLAUDE.md`, `docs/FOOTPRINT.md`.
 7. Windows: `link/transfer_core.py` (pure range/resume logic) + `link/transfer.py` (data-connection and disk I/O), `clipbridge.data.v1` in `link/server.py`, `features/files/` (destination, name clash, tray balloon); tests drive it with `tests/tclient.py` acting as the phone.
 8. Windows shell: `clipbridge send` + named pipe, context-menu verb, SendTo shortcut, `uninstall --purge`.
 9. Android: `link/Transfer.kt` (data connections over OkHttp, Wi-Fi lock), `features/files/`, share target for any file. Independent of 7–8 (works from the spec) → can run in parallel.
@@ -234,7 +239,7 @@ On the extender, Wi-Fi stalls of 10–20 s drop the link; the transfer reconnect
 ## Verification
 - `pytest windows/tests` and `gradlew :app:testDebugUnitTest` — both pass identical vectors.
 - E2E: copy on PC → appears on phone (<1s); copy in any phone app → appears on PC; repeat copies, no ping-pong (check logs show drops).
-- Security: wrong PSK client rejected (4401); rogue server (wrong PSK) rejected by phone before any clip sent; tampered/replayed frame closes connection (Python test).
+- Security: wrong PSK or unknown device rejected (4401); unpaired device disconnected (4401); rogue server (wrong PSK) rejected by phone before any clip sent; tampered/replayed frame closes connection (Python test).
 - Resilience: toggle phone Wi-Fi; PC sleep 10 min → resume; switch PC networks (IP change → re-announce); reboot phone (auto-start); reboot PC/log off-on (task starts, single instance); kill pythonw (restarts ≤1 min); `adb shell am kill` / force background 1h (vivo killer).
 - Password manager copy on Windows not synced.
 - Files: right-click a 1 GB file → appears in phone `Downloads/ClipShare`; share 5 photos + a PDF from the phone → land in `Downloads\ClipShare`; phone Wi-Fi off/on mid-transfer → resumes, not restarts; corrupted range → `ok:false` then one clean retry; clipboard keeps syncing during a transfer; `uninstall --purge` leaves nothing from `docs/FOOTPRINT.md` but received files.

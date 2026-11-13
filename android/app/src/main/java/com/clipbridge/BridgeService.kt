@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import com.clipbridge.features.clipboard.ClipboardFeature
@@ -20,6 +21,7 @@ import com.clipbridge.link.BridgeClient
 import com.clipbridge.link.Discovery
 import com.clipbridge.link.Endpoint
 import com.clipbridge.link.FeatureRouter
+import com.clipbridge.link.Hello
 import com.clipbridge.link.LinkState
 import com.clipbridge.link.NetworkWatcher
 import com.clipbridge.link.PartialStore
@@ -58,8 +60,8 @@ class BridgeService : Service() {
         val transferLock = TransferLock(this)
         client = BridgeClient(
             scope = scope,
-            deviceId = settings.deviceId,
-            pskProvider = { settings.psk },
+            pairingProvider = { settings.pairing },
+            deviceName = Hello.deviceName(Build.MODEL),
             endpointsProvider = { Endpoint.order(settings.manual, discovery.found.value, settings.cached) },
             router = router,
             onGoodEndpoint = { settings.cached = it },

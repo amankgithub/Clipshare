@@ -26,8 +26,7 @@ private enum class Phase { CHALLENGE, AUTH_OK, READY }
  */
 class SecureSocket(
     private val scope: CoroutineScope,
-    private val psk: ByteArray,
-    private val deviceId: String,
+    private val pairing: Pairing,
     val endpoint: Endpoint,
     private val subprotocol: String,
     private val onReady: (SecureSocket) -> Unit,
@@ -50,7 +49,14 @@ class SecureSocket(
             .header("Sec-WebSocket-Protocol", subprotocol).build()
         ws = http.newWebSocket(req, this)
         // Covers TCP, upgrade and handshake: a peer that never answers must not hold the endpoint list.
-        timer = scope.launch { delay(HANDSHAKE_TIMEOUT_MS); if (phase != Phase.READY) this@SecureSocket.cancel() }
+        // Close 4408 (PROTOCOL.md section 3); cancel if the close handshake does not finish promptly.
+        timer = scope.launch {
+            delay(HANDSHAKE_TIMEOUT_MS)
+            if (phase == Phase.READY) return@launch
+            close(4408)
+            delay(CLOSE_GRACE_MS)
+            if (!closed.isCompleted) this@SecureSocket.cancel()
+        }
         return this
     }
 
@@ -90,9 +96,9 @@ class SecureSocket(
         if (m.optInt("v", -1) != 1) return close(4400)
         sn = B64.decode(m.optString("sn"), 16) ?: return close(4400)
         cn = ByteArray(16).also { SecureRandom().nextBytes(it) }
-        val mac = Crypto.clientMac(psk, sn, cn, deviceId)
+        val mac = Crypto.clientMac(pairing.psk, sn, cn, pairing.device)
         val auth = JSONObject().put("type", "auth").put("v", 1).put("cn", B64.encode(cn))
-            .put("device", deviceId).put("mac", B64.encode(mac))
+            .put("device", pairing.device).put("mac", B64.encode(mac))
         phase = Phase.AUTH_OK
         ws.send(auth.toString())
     }
@@ -100,8 +106,8 @@ class SecureSocket(
     private fun onAuthOk(m: JSONObject) {
         if (m.optString("type") != "auth_ok") return close(4400)
         val mac = B64.decode(m.optString("mac"), 32) ?: return close(4400)
-        if (!Crypto.constantTimeEquals(mac, Crypto.serverMac(psk, sn, cn))) return close(4401)
-        val (c2s, s2c) = Crypto.sessionKeys(psk, sn, cn)
+        if (!Crypto.constantTimeEquals(mac, Crypto.serverMac(pairing.psk, sn, cn))) return close(4401)
+        val (c2s, s2c) = Crypto.sessionKeys(pairing.psk, sn, cn)
         cipher = FrameCipher(c2s, s2c)
         timer?.cancel()
         phase = Phase.READY
@@ -127,6 +133,8 @@ class SecureSocket(
 
     private companion object {
         const val HANDSHAKE_TIMEOUT_MS = 10_000L
+        /** How long a timed-out handshake waits for the 4408 close to complete before dropping the socket. */
+        const val CLOSE_GRACE_MS = 1_000L
         const val MAX_HANDSHAKE_TEXT = 4096
         /** Largest plaintext envelope plus frame overhead (counter, tag) with headroom. */
         const val MAX_FRAME = Envelopes.MAX_PLAINTEXT + 1024

@@ -44,6 +44,7 @@ class Link:
         self._features: dict[str, Feature] = {}
         self._registry = PeerRegistry()
         self._server: Server | None = None
+        self._sending: set[asyncio.Future[bool]] = set()
         self._transfers = TransferService(self.send, self._registry.get, self._features.get, partial_dir)
 
     # -- feature API -------------------------------------------------------
@@ -71,8 +72,16 @@ class Link:
     async def broadcast(
         self, header: dict[str, Any], body: bytes = b"", exclude: Peer | None = None
     ) -> None:
-        targets = [p for p in self._registry.all() if p is not exclude]
-        await asyncio.gather(*(self.send(p, header, body) for p in targets))
+        """Queue the message for every peer except `exclude`; returns without waiting for slow peers."""
+        for peer in self._registry.all():
+            if peer is not exclude:
+                self._queue(peer, header, body)
+
+    def _queue(self, peer: Peer, header: dict[str, Any], body: bytes = b"") -> None:
+        """Send in the background. Queued messages reach each peer in queue order (its send lock is FIFO)."""
+        task = asyncio.ensure_future(self.send(peer, header, body))
+        self._sending.add(task)
+        task.add_done_callback(self._sending.discard)
 
     async def send_file(
         self, peer: Peer, feature: str, path: Path, meta: dict[str, Any] | None = None
@@ -102,6 +111,9 @@ class Link:
 
     async def stop(self) -> None:
         await self._transfers.stop()
+        for task in list(self._sending):
+            task.cancel()
+        await asyncio.gather(*self._sending, return_exceptions=True)
         if self._server is not None:
             self._server.close(close_connections=True)
             await self._server.wait_closed()
@@ -200,8 +212,8 @@ class Link:
             log.exception("feature %s failed on message", feature.name)
             return
         mid = receipts.requested_mid(header)
-        if mid is not None:
-            await self.send(peer, receipts.ack(mid))
+        if mid is not None:  # queued: a relay stalled on this peer must not stop reading from it
+            self._queue(peer, receipts.ack(mid))
 
     async def _notify(self, method: str, peer: Peer) -> None:
         for feature in self._features.values():

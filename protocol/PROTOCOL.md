@@ -237,6 +237,10 @@ Image clip:
 
 - WebSocket ping/pong (control frames, not encrypted).
 - Server: ping every **10 s**; close if no pong within **10 s**.
+- Server: a connection that accepts no outgoing bytes for **20 s** while a send is pending is
+  dropped (a ping cannot detect this: it waits behind the same full write buffer).
+- Server (informative): relays and receipts are queued, never delaying reading from the sending client, so a
+  slow or vanished client cannot hold back another client's receipts.
 - Client (OkHttp `pingInterval`): ping every **15 s**; connection fails if a pong is missing by the next ping.
 - Client reconnect backoff (informative): 1 s doubling, capped at **10 s**, ±20 % jitter, reset
   after a successful handshake; retry immediately on a new network.

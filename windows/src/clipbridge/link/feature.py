@@ -39,7 +39,9 @@ class Sender(Protocol):
 
     async def broadcast(
         self, header: dict[str, Any], body: bytes = b"", exclude: Peer | None = None
-    ) -> None: ...
+    ) -> None:
+        """Queue for every peer except `exclude`; does not wait for delivery or for slow peers."""
+        ...
 
     async def send_file(
         self, peer: Peer, feature: str, path: Path, meta: dict[str, Any] | None = None

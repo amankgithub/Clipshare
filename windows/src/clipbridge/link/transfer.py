@@ -485,8 +485,8 @@ class TransferService:
                             asyncio.to_thread(_read_hashed, f, min(CHUNK, remaining), sha)
                         )
                     frame = await asyncio.to_thread(conn.seal, core.data(), block)
-                    await conn.ws.send(frame)
-                await conn.ws.send(await asyncio.to_thread(conn.seal, core.end(sha.hexdigest())))
+                    await conn.transmit(frame)
+                await conn.transmit(await asyncio.to_thread(conn.seal, core.end(sha.hexdigest())))
             finally:
                 if pending is not None:
                     pending.cancel()

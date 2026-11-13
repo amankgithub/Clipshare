@@ -153,7 +153,20 @@ Severity: **H** high, **M** medium, **L** low.
 - **Fix**: On Windows, catch `OSError` in `_receive_range`, then `_discard`, send `xfer_cancel`, and close with 1000. On Android, add an
   inactivity timeout to `offerOnce`, measured from the last progress rather than total time.
 
-### B4. M: Relaying clips blocks the Windows receive loop for the sending phone
+### B4. M: Relaying clips blocks the Windows receive loop for the sending phone (fixed)
+- **Status**: Reproduced on devices 2026-11-12 (a 4 MB image from one phone was reported "not delivered" while a
+  second phone's connection was half-open). Worse than described: the keepalive ping waits behind the same full
+  write buffer, so the dead peer was never closed and every later relay queued behind it. Fixed: `broadcast` no
+  longer waits for peers, and `Peer.transmit` drops a connection that accepts no bytes for 20 s (PROTOCOL.md
+  section 9). Tests: `test_relay_to_stalled_peer_does_not_delay_sender`, `test_stalled_peer_is_dropped`.
+- **Seen on devices** (2026-11-12, 22:48–22:51): phone .52 shared a 3 999 548-byte image four times. Each send logged
+  `image delivered=false` after 10 s, followed by `clipbridge.v1 failure: SocketException` / `SocketTimeoutException`
+  (OkHttp got no pong). On the PC, port 8765 still showed an `Established` connection from phone .33, but .33 did not
+  answer ping ("Destination host unreachable"): a half-open peer that keepalive never closed. A server restart cleared it.
+- **Present since** `1952a62` (first Windows server: relay awaited every peer); images used the same path from `eac6443`.
+  It stayed hidden until it hit all three conditions at once: a second client connected, that client gone without
+  closing, and a message larger than the socket buffers (short text fits in the buffer, so its send completes even
+  to a dead peer).
 - `features/clipboard/feature.py:131-154`; `link/server.py:71-75,167-181`
 - **What**: `on_message` awaits `broadcast`, and each `ws.send` waits for that peer's TCP drain. The sender's `_serve_peer` loop does not
   read its next message, or send its receipt, until every other phone has accepted the bytes.

@@ -170,6 +170,55 @@ async def test_image_relay_between_clients(tmp_path) -> None:
         await link.stop()
 
 
+@pytest.fixture
+async def stalled(tmp_path) -> AsyncIterator[tuple[Link, TestClient, TestClient]]:
+    """Link with phone A reading normally and phone B that stopped reading (vanished mid-send)."""
+    link = Link(PSK, tmp_path / "partial", host="127.0.0.1", port=0)
+    link.register(ClipboardFeature(link, lambda t: None, lambda png: None, save_dir=tmp_path))
+    await link.start()
+    a = await TestClient.connect(link.port, PSK, "phone-a")
+    b = await TestClient.connect(link.port, PSK, "phone-b")
+    await asyncio.sleep(0.1)
+    b.ws.transport.pause_reading()
+    for _ in range(3):  # more than the loopback socket buffers hold
+        await a.send(image_clip(), os.urandom(12 * 1024 * 1024))
+    yield link, a, b
+    await link.stop()
+
+
+async def test_relay_to_stalled_peer_does_not_delay_sender(stalled) -> None:
+    _, a, _ = stalled
+    await a.send({**clip("after images"), "mid": "late"})
+    header, _ = await asyncio.wait_for(a.recv(), 5)
+    assert header == {"ch": "link", "type": "ack", "mid": "late"}
+
+
+async def test_stalled_peer_is_dropped(stalled, monkeypatch) -> None:
+    from clipbridge.link import peers
+
+    monkeypatch.setattr(peers, "STALL_TIMEOUT", 0.5)
+    monkeypatch.setattr(peers, "STALL_POLL", 0.1)
+    link, a, _ = stalled
+    await a.send(image_clip(), os.urandom(1024))  # a send that starts after the patch
+    for _ in range(50):
+        if [p.device for p in link.peers] == ["phone-a"]:
+            break
+        await asyncio.sleep(0.1)
+    assert [p.device for p in link.peers] == ["phone-a"]
+
+
+async def test_send_to_stalled_peer_reports_failure(stalled, monkeypatch) -> None:
+    from clipbridge.link import peers
+
+    monkeypatch.setattr(peers, "STALL_TIMEOUT", 0.5)
+    monkeypatch.setattr(peers, "STALL_POLL", 0.1)
+    link, _, _ = stalled
+    b = next(p for p in link.peers if p.device == "phone-b")
+    for _ in range(3):  # whatever the socket buffers absorbed, these cannot all fit
+        await link.broadcast(image_clip(), os.urandom(12 * 1024 * 1024))
+    assert await asyncio.wait_for(link.send(b, clip("lost")), 10) is False
+
+
 async def test_duplicate_device_replaces_older_4409(env) -> None:
     link, _ = env
     old = await TestClient.connect(link.port, PSK, "same")

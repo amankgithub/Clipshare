@@ -183,9 +183,30 @@ On the extender, Wi-Fi stalls of 10–20 s drop the link; the transfer reconnect
 
 ## Keeping sessions small (usage limits)
 - Repo carries its own context so fresh sessions start cheap: short `CLAUDE.md` (layout, commands, conventions, ≤40 lines) + `protocol/PROTOCOL.md`. No session needs this chat.
-- Each build step below = **one fresh session** with a short brief ("implement step N per PLAN.md"), ending in passing tests. This plan copied to `docs/PLAN.md` in repo as step 1.
-- Steps 2 and 3 are independent after step 1 (both work from spec + vectors) → can run in parallel sessions.
-- No subagent fan-out; sessions read only the files their step touches.
+- Each build step below = **one fresh orchestrator session**. It writes no feature code; it splits the step into
+  worker sessions, reviews, runs both full suites, edits the docs and makes the one commit for the step.
+- Every session pays a fixed start cost and re-sends its whole context each turn, so a split pays only when the
+  pieces touch **disjoint files** and each is real work (small fixes are bundled into one piece).
+- Orchestrator per step:
+  1. One read-only locator subagent (compressed output) maps every item of the step to its current `file:line`
+     and test file; briefs carry those targets so workers skip exploration.
+  2. A step that changes the wire runs a **spec worker** alone first (`PROTOCOL.md`, `gen_vectors.py`,
+     `test_vectors.json`); then one worker per side runs in parallel from spec + vectors.
+  3. Workers share the checkout, edit only the files in their brief (code + tests), run only their own test
+     files (a full suite would see another worker's half-done edits), never edit other docs, never commit.
+     Mechanical pieces run on a cheaper model; protocol and crypto pieces keep the default model.
+  4. One reviewer subagent on the combined diff; findings go back to the worker that wrote the code, not fixed here.
+  5. Orchestrator: both full suites, `REVIEW.md` / `PROTOCOL.md` / this file / `CLAUDE.md` updates, one commit.
+- Brief template: "PLAN.md step N, piece X: items. Edit only: `file:line` list. Read: `CLAUDE.md`, `PROTOCOL.md` §y
+  only if listed. Done = own test files pass. No docs, no commit. Report in 5 lines max."
+- Planned split for the next steps (fixed exactly by each step's orchestrator after the previous step lands):
+  - 12: spec worker (per-device keys, `hello`, request/response, vectors), then Windows + Android workers.
+  - 13: spec worker (streams; file transfer and large clip bodies move onto them), then Windows + Android workers.
+  - 14: phase 1 Windows + Android `platform/` workers (extract clipboard, notifications/tray, settings, storage,
+    power, command bus; per-feature serial queues; log-redaction helper); phase 2 Windows + Android `entry/`
+    workers (feature public APIs, CLI/Explorer/tray menu, QS tiles, share router; `app.py` / `BridgeService.kt`
+    composition roots). No behaviour change.
+- Device checks on the vivo after steps 11, 12 and 14: clip both ways, file both ways, Wi-Fi toggle reconnect.
 
 ## Build order
 0. **Spike (de-risk, throwaway, on the vivo)**: minimal APK with FGS + listener + logcat reader + transparent activity. Confirm on Android 16: (a) denial line format, (b) logcat consent dialog behavior from a FGS and after reboot, (c) background activity start + clipboard read works. Outcome decides: auto-sync as designed / auto-sync needing "re-enable after reboot" notification tap / manual-only (tile+share). Report result before continuing.

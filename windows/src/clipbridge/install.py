@@ -161,6 +161,19 @@ def _elevated(command: str, args: str) -> bool:
     return _run(["powershell", "-NoProfile", "-Command", ps]).returncode == 0
 
 
+def firewall_args() -> str:
+    """cmd.exe args: drop any rule of this name (netsh allows duplicates), then add the private-only one.
+
+    The rule only admits the local subnet on private networks. The exit code is the add's.
+    """
+    delete = f'netsh advfirewall firewall delete rule name="{FIREWALL_RULE}"'
+    add = (
+        f'netsh advfirewall firewall add rule name="{FIREWALL_RULE}" dir=in action=allow '
+        f"protocol=TCP localport={PORT} profile=private remoteip=localsubnet"
+    )
+    return f"/c {delete} & {add}"
+
+
 def install() -> int:
     xml = task_xml(pythonw_path(), _user())
     with tempfile.NamedTemporaryFile("w", suffix=".xml", encoding="utf-16", delete=False) as f:
@@ -181,11 +194,7 @@ def install() -> int:
     _write_shortcut(spec)
     print(f"SendTo shortcut added: {spec.path}")
     print("Next: a Windows UAC prompt will appear to add the firewall rule. Please approve it.")
-    rule = (
-        f'advfirewall firewall add rule name="{FIREWALL_RULE}" dir=in action=allow '
-        f"protocol=TCP localport={PORT} profile=private,public"
-    )
-    if not _elevated("netsh", rule):
+    if not _elevated("cmd", firewall_args()):
         print("Firewall rule NOT added (UAC declined or failed). Re-run install.")
         return 1
     print(f"Firewall rule '{FIREWALL_RULE}' added for TCP {PORT}.")

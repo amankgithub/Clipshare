@@ -100,3 +100,11 @@ def test_purge_dirs_never_include_received_files(monkeypatch: pytest.MonkeyPatch
         Path(r"C:\Users\me\AppData\Roaming\ClipBridge"),
         Path(r"C:\Users\me\AppData\Local\ClipBridge"),
     ]
+
+
+def test_firewall_rule_replaces_old_and_is_private_localsubnet_only() -> None:
+    args = install.firewall_args()
+    delete, add = args.split(" & ")
+    assert "delete rule" in delete and f'name="{install.FIREWALL_RULE}"' in delete
+    assert "add rule" in add and "profile=private " in add and "remoteip=localsubnet" in add
+    assert "public" not in args

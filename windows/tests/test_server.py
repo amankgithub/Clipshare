@@ -226,3 +226,44 @@ async def test_duplicate_device_replaces_older_4409(env) -> None:
     assert await closed_code(old.ws) == 4409
     assert len(link.peers) == 1
     await new.ws.close()
+
+
+async def test_oversize_preauth_message_closed(env) -> None:
+    link, _ = env
+    ws = await connect(f"ws://127.0.0.1:{link.port}/", subprotocols=["clipbridge.v1"])
+    await ws.recv()
+    await ws.send("x" * 5000)
+    assert await closed_code(ws) == 1009
+
+
+async def test_handshake_timeout_4408(env, monkeypatch) -> None:
+    link, _ = env
+    monkeypatch.setattr("clipbridge.link.server.AUTH_TIMEOUT", 0.3)
+    ws = await connect(f"ws://127.0.0.1:{link.port}/", subprotocols=["clipbridge.v1"])
+    await ws.recv()
+    assert await closed_code(ws) == 4408
+
+
+async def test_pending_handshake_cap_then_recovers(env, monkeypatch) -> None:
+    link, _ = env
+    monkeypatch.setattr("clipbridge.link.server.MAX_PENDING_HANDSHAKES", 2)
+    url = f"ws://127.0.0.1:{link.port}/"
+    held = [await connect(url, subprotocols=["clipbridge.v1"]) for _ in range(2)]
+    for ws in held:
+        await ws.recv()
+    extra = await connect(url, subprotocols=["clipbridge.v1"])
+    assert await closed_code(extra) == 1013
+    await held[0].close()
+    await asyncio.sleep(0.2)
+    c = await TestClient.connect(link.port, PSK)  # slot freed
+    await c.ws.close()
+    await held[1].close()
+
+
+async def test_full_size_allowed_after_auth(env) -> None:
+    link, written = env
+    c = await TestClient.connect(link.port, PSK)
+    await c.send(clip("y" * 100_000))
+    await asyncio.sleep(0.3)
+    assert written == ["y" * 100_000]
+    await c.ws.close()

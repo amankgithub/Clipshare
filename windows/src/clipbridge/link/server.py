@@ -28,7 +28,11 @@ log = logging.getLogger(__name__)
 SUBPROTOCOL = "clipbridge.v1"
 DATA_SUBPROTOCOL = "clipbridge.data.v1"
 DEFAULT_PORT = 8765
+# Pre-auth limits: an unauthenticated peer may hold at most MAX_PENDING_HANDSHAKES slots, each for at most
+# AUTH_TIMEOUT seconds in total (challenge + auth), and may send at most handshake.MAX_HANDSHAKE_BYTES.
 AUTH_TIMEOUT = 10.0
+MAX_PENDING_HANDSHAKES = 16
+CLOSE_TRY_AGAIN = 1013
 PING_INTERVAL = 10.0
 PING_TIMEOUT = 10.0
 MAX_MESSAGE = envelope.MAX_PLAINTEXT + crypto.MIN_FRAME_LEN
@@ -45,6 +49,7 @@ class Link:
         self._registry = PeerRegistry()
         self._server: Server | None = None
         self._sending: set[asyncio.Future[bool]] = set()
+        self._pending_handshakes = 0
         self._transfers = TransferService(self.send, self._registry.get, self._features.get, partial_dir)
 
     # -- feature API -------------------------------------------------------
@@ -156,14 +161,28 @@ class Link:
                 await self._notify("on_peer_disconnected", peer)
 
     async def _handshake(self, ws: ServerConnection) -> Peer | None:
-        sn = os.urandom(16)
-        await ws.send(handshake.challenge(sn))
+        if self._pending_handshakes >= MAX_PENDING_HANDSHAKES:
+            log.warning("too many pending handshakes; refusing connection")
+            await ws.close(CLOSE_TRY_AGAIN)
+            return None
+        self._pending_handshakes += 1
+        full_limit = ws.protocol.max_message_size
+        ws.protocol.max_message_size = handshake.MAX_HANDSHAKE_BYTES  # enforced while frames are parsed
         try:
-            message = await asyncio.wait_for(ws.recv(), AUTH_TIMEOUT)
-            auth = handshake.parse_auth(message)
+            peer = await asyncio.wait_for(self._authenticate(ws), AUTH_TIMEOUT)
         except asyncio.TimeoutError:
             await ws.close(handshake.CLOSE_TIMEOUT)
             return None
+        finally:
+            self._pending_handshakes -= 1
+        ws.protocol.max_message_size = full_limit
+        return peer
+
+    async def _authenticate(self, ws: ServerConnection) -> Peer | None:
+        sn = os.urandom(16)
+        await ws.send(handshake.challenge(sn))
+        try:
+            auth = handshake.parse_auth(await ws.recv())
         except HandshakeError as exc:
             await ws.close(exc.code)
             return None

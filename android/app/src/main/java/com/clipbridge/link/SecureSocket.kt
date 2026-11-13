@@ -49,6 +49,8 @@ class SecureSocket(
         val req = Request.Builder().url("ws://${endpoint.host}:${endpoint.port}/")
             .header("Sec-WebSocket-Protocol", subprotocol).build()
         ws = http.newWebSocket(req, this)
+        // Covers TCP, upgrade and handshake: a peer that never answers must not hold the endpoint list.
+        timer = scope.launch { delay(HANDSHAKE_TIMEOUT_MS); if (phase != Phase.READY) this@SecureSocket.cancel() }
         return this
     }
 
@@ -73,6 +75,7 @@ class SecureSocket(
     }
 
     override fun onMessage(webSocket: WebSocket, text: String) {
+        if (text.length > MAX_HANDSHAKE_TEXT) return close(4400)
         try {
             when (phase) {
                 Phase.CHALLENGE -> onChallenge(JSONObject(text))
@@ -92,7 +95,6 @@ class SecureSocket(
             .put("device", deviceId).put("mac", B64.encode(mac))
         phase = Phase.AUTH_OK
         ws.send(auth.toString())
-        timer = scope.launch { delay(10_000); if (phase != Phase.READY) close(4408) }
     }
 
     private fun onAuthOk(m: JSONObject) {
@@ -107,7 +109,7 @@ class SecureSocket(
     }
 
     override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-        if (phase != Phase.READY) return close(4400)
+        if (phase != Phase.READY || bytes.size > MAX_FRAME) return close(4400)
         val plaintext = try { cipher!!.decrypt(bytes.toByteArray()) } catch (e: FrameException) { return close(4402) }
         onPlaintext(this, plaintext)
     }
@@ -122,4 +124,11 @@ class SecureSocket(
     }
 
     private fun finish() { timer?.cancel(); closed.complete(phase == Phase.READY) }
+
+    private companion object {
+        const val HANDSHAKE_TIMEOUT_MS = 10_000L
+        const val MAX_HANDSHAKE_TEXT = 4096
+        /** Largest plaintext envelope plus frame overhead (counter, tag) with headroom. */
+        const val MAX_FRAME = Envelopes.MAX_PLAINTEXT + 1024
+    }
 }

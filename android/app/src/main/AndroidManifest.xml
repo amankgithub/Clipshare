@@ -16,6 +16,8 @@
     <application
         android:label="ClipBridge"
         android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:usesCleartextTraffic="true">
 
         <activity android:name=".MainActivity" android:exported="true"

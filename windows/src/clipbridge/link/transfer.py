@@ -5,9 +5,11 @@ The link owns one `TransferService`. Pure rules (ranges, hashing, validation) li
 bytes run on worker threads so the event loop (and every clipboard message) never waits on them.
 
 Receiving: `<id>.part` (preallocated) and `<id>.json` (offer, destination, ranges with `have`)
-under the partial directory; the `.part` is renamed to the feature's destination once every
-range hash matched. Sending: an in-memory FIFO per device, one file at a time (`STREAMS`), whose
-unfinished head is re-offered with the same id after a reconnect.
+under the partial directory, plus `completed.json` (recently completed ids); the `.part` is renamed to the feature's destination once every
+range hash matched, and its id is remembered (`CompletedIds`) so a re-offer after a lost
+`xfer_done` is confirmed instead of received twice. A storage error cancels the transfer. Sending: an in-memory FIFO per device, one file at a time (`STREAMS`), whose
+unfinished head is re-offered with the same id after a reconnect, and given up (`xfer_cancel`)
+once nothing has moved on it for `STALL_TIMEOUT`.
 """
 
 from __future__ import annotations
@@ -35,7 +37,11 @@ from clipbridge.link.transfer_core import CHUNK, FileOffer, Range, RangeStream, 
 log = logging.getLogger(__name__)
 
 PARTIAL_MAX_AGE = 24 * 3600.0
-_LOST = {"type": "lost"}  # local marker: the control connection of an offer closed
+STALL_TIMEOUT = 60.0  # sender gives up when an offer sees no reply and no range progress this long
+# local markers in an offer's reply queue
+_LOST = {"type": "lost"}  # the control connection of the offer closed
+_STALLED = {"type": "stalled"}  # nothing moved for STALL_TIMEOUT
+_UNREADABLE = {"type": "unreadable"}  # the source file could not be read
 
 SendFn = Callable[[Peer, dict[str, Any]], Awaitable[bool]]
 PeerFn = Callable[[str], "Peer | None"]
@@ -116,6 +122,7 @@ class Outgoing:
     conns: set[Peer] = field(default_factory=set)
     replies: asyncio.Queue[dict[str, Any]] = field(default_factory=asyncio.Queue)
     retried: bool = False
+    active: float = 0.0  # monotonic time of the last reply or range progress
 
 
 class TransferService:
@@ -129,6 +136,7 @@ class TransferService:
         self._queues: dict[str, collections.deque[Outgoing]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._data_conns: dict[str, set[Peer]] = {}
+        self._completed = self._load_completed()
 
     # -- lifecycle -----------------------------------------------------------
     def prune(self, now: float | None = None) -> None:
@@ -186,6 +194,36 @@ class TransferService:
         log.debug("ignored %s for unknown id", kind)
 
     # -- receiving -----------------------------------------------------------
+    @property
+    def _completed_path(self) -> Path:
+        return self._dir / "completed.json"
+
+    def _load_completed(self) -> core.CompletedIds:
+        try:
+            raw = json.loads(self._completed_path.read_text("utf-8"))
+        except FileNotFoundError:
+            raw = []
+        except (OSError, ValueError):
+            log.warning("dropping unreadable completed-transfer record")
+            raw = []
+        return core.CompletedIds.from_json(raw, time.time())
+
+    async def _remember(self, offer: FileOffer, device: str) -> None:
+        """Record a completed id (PROTOCOL.md 6.2) and save the record."""
+        self._completed.add(offer.id, device, offer.size, time.time())
+        data = json.dumps(self._completed.to_json())
+
+        def save() -> None:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            tmp = self._completed_path.with_suffix(".tmp")
+            tmp.write_text(data, "utf-8")
+            os.replace(tmp, self._completed_path)
+
+        try:
+            await asyncio.to_thread(save)
+        except OSError:
+            log.warning("could not save completed-transfer record")
+
     def _state_path(self, fid: str) -> Path:
         return self._dir / f"{fid}.json"
 
@@ -212,11 +250,18 @@ class TransferService:
         if offer is None:
             log.warning("malformed xfer_offer from %s", peer.device)
             return
+        if self._completed.has(offer.id, peer.device, offer.size, time.time()):
+            log.info("re-offer of completed %s from %s; confirming", offer.id[:8], peer.device)
+            await self._send(peer, core.accept(offer.id, core.full_ranges(offer.size)))
+            await self._send(peer, core.done(offer.id, True))
+            return
         inc = self._incoming.get(offer.id) or await asyncio.to_thread(self._load, offer.id)
         if inc is not None and (inc.device != peer.device or inc.offer.size != offer.size):
             await self._discard(inc)
             inc = None
         if inc is not None:
+            core.rewind_full(inc.ranges)
+            inc.ended.clear()  # every range ends (and is verified) again with xfer_end
             self._incoming[offer.id] = inc
             log.info(
                 "resume %s (%d bytes, have %d) from %s",
@@ -278,6 +323,7 @@ class TransferService:
                 log.exception("cannot create %s", dest.name)
                 await self._send(peer, core.done(offer.id, False))
                 return
+        await self._remember(offer, peer.device)
         await self._send(peer, core.done(offer.id, True))
         await self._deliver(peer, offer, dest)
 
@@ -305,6 +351,14 @@ class TransferService:
                     await asyncio.to_thread(inc.save)
             finally:
                 await asyncio.to_thread(f.close)
+        except OSError as exc:
+            # Our storage failed (disk full, file locked or gone): this transfer cannot finish.
+            log.warning("transfer %s: cannot write partial file (%s); cancelling", fid[:8], type(exc).__name__)
+            peer = self._peer_for(inc.device)
+            if peer is not None:  # before the data connection closes, so the sender sees a cancel, not a broken link
+                await self._send(peer, core.cancel(fid))
+            await self._discard(inc)  # also closes this data connection (1000)
+            return
         finally:
             inc.streaming.discard(rng.start)
             inc.conns.discard(conn)
@@ -345,6 +399,7 @@ class TransferService:
                     await self._send(peer, core.done(fid, False))
                 return
         inc.state.unlink(missing_ok=True)
+        await self._remember(inc.offer, inc.device)
         log.info("transfer %s complete (%d bytes)", fid[:8], inc.offer.size)
         if peer is not None:
             await self._send(peer, core.done(fid, True))
@@ -420,15 +475,22 @@ class TransferService:
         item.peer = peer
         item.replies = asyncio.Queue()
         item.ranges = {}
+        item.active = time.monotonic()
         self._outgoing[item.offer.id] = item
         try:
             if not await self._send(peer, item.offer.to_header()):
                 return None
             while True:
-                reply = await item.replies.get()
+                reply = await self._next_reply(item)
                 kind = reply.get("type")
                 if kind == "lost":
                     return None
+                if kind == "stalled":
+                    log.warning("transfer %s to %s stalled; cancelling", item.offer.id[:8], peer.device)
+                    await self._send(peer, core.cancel(item.offer.id))
+                    return False
+                if kind == "unreadable":  # serve_data already sent xfer_cancel
+                    return False
                 if kind == "xfer_accept":
                     ranges = core.parse_ranges(reply.get("ranges"), item.offer.size)
                     if ranges is None:
@@ -457,6 +519,20 @@ class TransferService:
                 del self._outgoing[item.offer.id]
             self._close_conns(item)
 
+    @staticmethod
+    async def _next_reply(item: Outgoing) -> dict[str, Any]:
+        """The next reply to an offer, or `_STALLED` once nothing has moved for STALL_TIMEOUT."""
+        while True:
+            left = STALL_TIMEOUT - (time.monotonic() - item.active)
+            if left <= 0:
+                return _STALLED
+            try:
+                reply = await asyncio.wait_for(item.replies.get(), left)
+            except asyncio.TimeoutError:
+                continue  # range progress may have moved `active` meanwhile
+            item.active = time.monotonic()
+            return reply
+
     def _close_conns(self, item: Outgoing) -> None:
         for conn in list(item.conns):
             asyncio.ensure_future(conn.ws.close(1000))
@@ -471,7 +547,12 @@ class TransferService:
         try:
             f = await asyncio.to_thread(open, item.path, "rb")
             try:
-                await asyncio.to_thread(_hash_region, f, rng.start, rng.have, sha.update)
+                def hash_prefix(block: bytes) -> None:
+                    sha.update(block)
+                    item.active = time.monotonic()  # hashing a long resume prefix is progress too
+
+                await asyncio.to_thread(_hash_region, f, rng.start, rng.have, hash_prefix)
+                item.active = time.monotonic()
                 if remaining > 0:  # read-ahead: the next chunk loads while this one is sent
                     pending = asyncio.ensure_future(asyncio.to_thread(_read_hashed, f, min(CHUNK, remaining), sha))
                 while pending is not None:
@@ -486,6 +567,7 @@ class TransferService:
                         )
                     frame = await asyncio.to_thread(conn.seal, core.data(), block)
                     await conn.transmit(frame)
+                    item.active = time.monotonic()
                 await conn.transmit(await asyncio.to_thread(conn.seal, core.end(sha.hexdigest())))
             finally:
                 if pending is not None:
@@ -529,7 +611,15 @@ class TransferService:
                 elif item is not None and item.device == conn.device and start in item.ranges:
                     if start in item.streaming:
                         break
-                    await self._send_range(conn, item, item.ranges[start])
+                    try:
+                        await self._send_range(conn, item, item.ranges[start])
+                    except OSError as exc:
+                        log.warning("transfer %s: cannot read source (%s); cancelling", fid[:8], type(exc).__name__)
+                        if item.peer is not None:  # before the close, so the receiver sees a cancel, not a broken link
+                            await self._send(item.peer, core.cancel(fid))
+                        item.replies.put_nowait(_UNREADABLE)
+                        await conn.ws.close(1000)
+                        return
                 else:
                     break
             log.info("data connection from %s: unknown transfer or range", conn.device)

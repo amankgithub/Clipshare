@@ -117,11 +117,32 @@ class ProtocolTest {
         assertEquals(1, logs.size)
     }
 
+    @Test fun backupIsDisabledAndPairingKeyExcluded() {
+        val manifest = java.io.File("src/main/AndroidManifest.xml").readText()
+        assertTrue(manifest.contains("android:allowBackup=\"false\""))
+        assertTrue(manifest.contains("android:dataExtractionRules=\"@xml/data_extraction_rules\""))
+        val rules = java.io.File("src/main/res/xml/data_extraction_rules.xml").readText()
+        for (section in listOf("cloud-backup", "device-transfer")) {
+            val body = rules.substringAfter("<$section>").substringBefore("</$section>")
+            assertTrue(section, body.contains("<exclude domain=\"sharedpref\""))
+            assertTrue(section, !body.contains("<include"))
+        }
+    }
+
     @Test fun endpointsAndBackoff() {
         assertEquals(Endpoint("1.2.3.4", 8765), Endpoint.parse("1.2.3.4"))
         assertEquals(Endpoint("1.2.3.4", 9), Endpoint.parse("1.2.3.4:9"))
         assertNull(Endpoint.parse(" "))
         assertNull(Endpoint.parse("h:99999"))
+        assertNull(Endpoint.parse("fe80::1"))
+        assertNull(Endpoint.parse("a b"))
+        assertNull(Endpoint.parse("a b:9"))
+        assertNull(Endpoint.parse("h:"))
+        assertNull(Endpoint.parse("h:0"))
+        assertNull(Endpoint.parse("h:+9"))
+        assertNull(Endpoint.parse(":9"))
+        assertNull(Endpoint.parse("h/x"))
+        assertEquals(Endpoint("pc.local", 9), Endpoint.parse("pc.local:9"))
         val m = Endpoint("m"); val d = Endpoint("d"); val c = Endpoint("c")
         assertEquals(listOf(m, d, c), Endpoint.order(m, d, c))
         assertEquals(listOf(d, c), Endpoint.order(null, d, c))

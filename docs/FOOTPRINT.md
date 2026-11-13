@@ -9,7 +9,7 @@ listed here (see `CLAUDE.md`).
 |---|---|---|
 | Source code + Python dependencies (`websockets`, `zeroconf`, `pywin32`, `cryptography`, `Pillow`, dev: `pytest`, `pytest-asyncio`) | this repo folder; dependencies only in `windows\.venv` | deleting the repo folder |
 | Scheduled task `ClipBridge` (starts the server at logon / unlock) | Task Scheduler | `clipbridge uninstall` |
-| Firewall rule `ClipBridge` (inbound TCP 8765) | Windows Defender Firewall | `clipbridge uninstall` (one UAC prompt) |
+| Firewall rule `ClipBridge` (inbound TCP 8765, Private profile, local subnet) | Windows Defender Firewall | `clipbridge uninstall` (one UAC prompt) |
 | Context-menu verb "Send to phone" | `HKCU\Software\Classes\*\shell\ClipBridge` | `clipbridge uninstall` |
 | SendTo shortcut "Phone (ClipBridge)" | `shell:sendto` (`%APPDATA%\Microsoft\Windows\SendTo`) | `clipbridge uninstall` |
 | Config + DPAPI-encrypted key | `%APPDATA%\ClipBridge` | `clipbridge uninstall --purge` |

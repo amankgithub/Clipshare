@@ -121,12 +121,16 @@ object TransferCore {
 
     /**
      * Ranges to accept an offer with: [saved] (with its `have` values) when it still describes the
-     * same file, else a fresh split.
+     * same file, else a fresh split. A range fully on disk is not yet verified, so it is reported one
+     * byte short: the sender streams that byte and `xfer_end`, and the hash is checked.
      */
     fun resumeRanges(offer: FileOffer, saved: PartialState?, token: String): List<Range> =
         if (saved != null && saved.token == token && saved.offer.size == offer.size && saved.offer.feature == offer.feature &&
             parseRanges(rangesJson(saved.ranges), offer.size) != null
-        ) saved.ranges.map { it.copy() } else split(offer.size)
+        ) saved.ranges.map { it.copy(have = minOf(it.have, it.length - 1)) } else split(offer.size)
+
+    /** The split of a file this receiver already completed (`have` = length everywhere). */
+    fun fullRanges(size: Long): List<Range> = split(size).map { it.copy(have = it.length) }
 
     // -- control and data messages ---------------------------------------------------------------
 
@@ -209,5 +213,60 @@ class RangeStream(val range: Range) {
         val digest = h.opt("sha256")
         if (!TransferCore.isValidSha(digest)) throw TransferViolation("bad sha256")
         return digest == TransferCore.hex(sha.digest())
+    }
+}
+
+/**
+ * Ids this receiver finished with `ok:true`, so a re-offer after a lost `xfer_done` is answered
+ * `ok:true` again instead of being received twice (PROTOCOL.md 6.2). Bounded by count and age; times
+ * are wall-clock so the record survives restarts ([toJson] / [parse]). Not thread-safe.
+ */
+class CompletedIds(private val maxItems: Int = 256, private val maxAgeMs: Long = 24L * 3600 * 1000) {
+    private class Entry(val peer: String, val size: Long, val atMs: Long)
+
+    private val items = LinkedHashMap<String, Entry>() // insertion order = completion order
+
+    val size: Int get() = items.size
+
+    fun add(id: String, peer: String, size: Long, nowMs: Long) {
+        items.remove(id)
+        items[id] = Entry(peer, size, nowMs)
+        prune(nowMs)
+    }
+
+    fun has(id: String, peer: String, size: Long, nowMs: Long): Boolean {
+        prune(nowMs)
+        val e = items[id] ?: return false
+        return e.peer == peer && e.size == size
+    }
+
+    fun toJson(): String = JSONArray().also { a ->
+        items.forEach { (id, e) -> a.put(JSONArray().put(id).put(e.peer).put(e.size).put(e.atMs)) }
+    }.toString()
+
+    private fun prune(nowMs: Long) {
+        val it = items.values.iterator()
+        while (it.hasNext()) {
+            val e = it.next()
+            if (items.size <= maxItems && nowMs - e.atMs <= maxAgeMs) break
+            it.remove()
+        }
+    }
+
+    companion object {
+        /** Rebuild from [toJson] output; malformed entries are skipped, unreadable input gives an empty record. */
+        fun parse(json: String?, nowMs: Long): CompletedIds {
+            val ids = CompletedIds()
+            val a = try { JSONArray(json ?: "[]") } catch (e: org.json.JSONException) { JSONArray() }
+            val loaded = (0 until a.length()).mapNotNull { i ->
+                val e = a.optJSONArray(i) ?: return@mapNotNull null
+                val id = e.opt(0); val peer = e.opt(1); val size = e.opt(2); val at = e.opt(3)
+                if (!TransferCore.validId(id) || peer !is String || size !is Number || at !is Number) null
+                else Triple(id as String, Entry(peer, size.toLong(), at.toLong()), at.toLong())
+            }
+            loaded.sortedBy { it.third }.forEach { (id, entry, _) -> ids.items[id] = entry }
+            ids.prune(nowMs)
+            return ids
+        }
     }
 }

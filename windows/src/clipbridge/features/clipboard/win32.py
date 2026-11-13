@@ -28,6 +28,7 @@ PBT_APMRESUMESUSPEND = 0x0007
 PBT_APMRESUMEAUTOMATIC = 0x0012
 HWND_MESSAGE = -3
 EXCLUDE_FORMAT = "ExcludeClipboardContentFromMonitorProcessing"
+OPTOUT_DWORD_FORMATS = ("CanIncludeInClipboardHistory", "CanUploadToCloudClipboard")  # DWORD 0 = do not sync
 OPEN_RETRY_DELAYS = (0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.5)
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -54,6 +55,7 @@ class ClipboardThread(threading.Thread):
         self._ready = threading.Event()
         self._error: BaseException | None = None
         self._exclude_fmt = 0
+        self._optout_fmts: tuple[int, ...] = ()
 
     # -- public (any thread) ----------------------------------------------
     def start_and_wait(self, timeout: float = 10.0) -> None:
@@ -86,6 +88,7 @@ class ClipboardThread(threading.Thread):
 
     def _create_window(self) -> None:
         self._exclude_fmt = win32clipboard.RegisterClipboardFormat(EXCLUDE_FORMAT)
+        self._optout_fmts = tuple(win32clipboard.RegisterClipboardFormat(name) for name in OPTOUT_DWORD_FORMATS)
         self._png_fmt = win32clipboard.RegisterClipboardFormat("PNG")
         hinst = win32api.GetModuleHandle(None)
         wc = win32gui.WNDCLASS()
@@ -136,11 +139,28 @@ class ClipboardThread(threading.Thread):
         log.warning("OpenClipboard failed after retries")
         return False
 
+    def _dword_is_zero(self, fmt: int) -> bool:
+        """True if the clipboard carries registered format `fmt` with DWORD value 0 (an opt-out marker)."""
+        if not win32clipboard.IsClipboardFormatAvailable(fmt):
+            return False
+        if not self._open():
+            return False
+        try:
+            data = win32clipboard.GetClipboardData(fmt)
+        except pywintypes.error:
+            return False
+        finally:
+            win32clipboard.CloseClipboard()
+        return isinstance(data, (bytes, bytearray)) and len(data) >= 4 and int.from_bytes(data[:4], "little") == 0
+
     def _handle_update(self) -> None:
-        if win32clipboard.IsClipboardFormatAvailable(self._exclude_fmt):
+        avail = win32clipboard.IsClipboardFormatAvailable
+        if avail(self._exclude_fmt):
             log.debug("clip skipped (excluded from monitoring)")
             return
-        avail = win32clipboard.IsClipboardFormatAvailable
+        if any(self._dword_is_zero(fmt) for fmt in self._optout_fmts):
+            log.debug("clip skipped (no history / no cloud)")
+            return
         if avail(win32con.CF_UNICODETEXT):
             fmt: int | None = win32con.CF_UNICODETEXT
         elif self._on_image is None:

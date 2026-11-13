@@ -19,7 +19,8 @@ Severity: **H** high, **M** medium, **L** low.
 
 ## A. Security and privacy
 
-### A1. H: Android PSK is stored in plain SharedPreferences and is included in Android backups
+### A1. H: Android PSK is stored in plain SharedPreferences and is included in Android backups (fixed)
+- **Status**: Fixed in step 11. `allowBackup=false` and `data_extraction_rules.xml` exclude the prefs from cloud backup and device transfer. Test: `ProtocolTest.backupIsDisabledAndPairingKeyExcluded`.
 - `android/app/src/main/java/com/clipbridge/Settings.kt:16-23`; `AndroidManifest.xml:16-19` (no `allowBackup`/`dataExtractionRules`)
 - **What**: `allowBackup` defaults to true, so the PSK and the `device` id in `clipbridge.xml` are uploaded by Auto Backup
   (Google Drive) and copied by device-to-device transfer.
@@ -44,7 +45,8 @@ Severity: **H** high, **M** medium, **L** low.
   with the key for the claimed device, and closes with 4401 for an unknown device. This is a change to spec §2/§3. If you keep the
   shared key, state in `PROTOCOL.md` that every paired device is fully trusted, including to impersonate the server.
 
-### A3. M: Server is exposed on public networks; mDNS is advertised on every interface
+### A3. M: Server is exposed on public networks; mDNS is advertised on every interface (fixed)
+- **Status**: Fixed in step 11. Firewall rule is `profile=private remoteip=localsubnet` and replaces any older rule on reinstall; mDNS advertises only private and link-local addresses. Tests: `test_shell.py`, `test_discovery.py`.
 - `windows/src/clipbridge/install.py:184-187` (`profile=private,public`, no `remoteip`); `link/discovery.py:19-22,35-42`; `server.py:39` (`0.0.0.0`)
 - **What**: On hotel or campus Wi-Fi, which `PLAN.md:11` names as the threat environment, port 8765 is open to every
   host. The laptop also announces `ClipBridge-<hostname>` there, and on VPN, Hyper-V and WSL adapters.
@@ -53,7 +55,8 @@ Severity: **H** high, **M** medium, **L** low.
 - **Fix**: Change the firewall rule to `profile=private remoteip=localsubnet`. Advertise only on the interface that holds the
   default route, or on private-profile networks. Tell the user once when the active network is Public.
 
-### A4. M: No pre-auth resource limits on Windows
+### A4. M: No pre-auth resource limits on Windows (fixed)
+- **Status**: Fixed in step 11. At most 16 handshakes at once (more get 1013), 10 s auth timeout, 4 KiB per-frame limit until `auth_ok` (PROTOCOL.md sections 3, 8). Tests in `test_server.py`.
 - `link/server.py:90-100,146-151`
 - **What**: `max_size` is 16 MiB from the first byte. The 4 KiB handshake limit (§8) is checked only after the whole
   message has been buffered. The websockets library also queues up to `max_queue` (16) messages per connection
@@ -62,7 +65,8 @@ Severity: **H** high, **M** medium, **L** low.
 - **Fix**: A semaphore on pre-auth handshakes (globally and per IP), `max_queue=1` and a small `max_size` until auth succeeds,
   and a per-IP connection rate limit.
 
-### A5. M: Android client has no challenge timeout and no inbound size limit, so a LAN host can hang or crash it without the PSK
+### A5. M: Android client has no challenge timeout and no inbound size limit, so a LAN host can hang or crash it without the PSK (fixed)
+- **Status**: Fixed in step 11. Handshake timer starts on open; handshake text capped at 4096, frames at the protocol max; a hung handshake falls through to the next endpoint. No unit test (needs a fake server).
 - `android/.../link/SecureSocket.kt:85-96` (timer starts only after `auth` is sent); `BridgeClient.kt:35-39` (`readTimeout(0)`); `SecureSocket.kt:75-83,109-113`
 - **What**: A server that accepts the WebSocket and never sends `challenge` holds the client forever. OkHttp answers the
   pings, so liveness never fails. OkHttp also has no limit on inbound message size.
@@ -73,7 +77,8 @@ Severity: **H** high, **M** medium, **L** low.
   the buffering, so document the §8 deviation or use a reader with a frame cap). When the mDNS endpoint fails the handshake,
   try the cached endpoint next, and do not let a failing mDNS result win again.
 
-### A6. M: Windows clipboard privacy hints are only partly honoured, so passwords can reach the phone
+### A6. M: Windows clipboard privacy hints are only partly honoured, so passwords can reach the phone (fixed)
+- **Status**: Fixed in step 11. `CanIncludeInClipboardHistory` and `CanUploadToCloudClipboard` with value 0 are skipped. Tests in `test_clipboard_win32.py`.
 - `windows/src/clipbridge/features/clipboard/win32.py:30,139-142`
 - **What**: Only `ExcludeClipboardContentFromMonitorProcessing` is honoured. The standard Windows formats
   `CanIncludeInClipboardHistory` (DWORD 0) and `CanUploadToCloudClipboard` (DWORD 0) are ignored. Some password managers and
@@ -127,7 +132,8 @@ Severity: **H** high, **M** medium, **L** low.
 
 ## B. Correctness and robustness
 
-### B1. M: An invalid manual host crashes the Android app in a loop
+### B1. M: An invalid manual host crashes the Android app in a loop (fixed)
+- **Status**: Fixed in step 11. `Endpoint.parse` rejects invalid hosts (spaces, IPv6, bad ports); `connectOnce` catches; one `CoroutineExceptionHandler` reaches the service, link and transfer scopes. Tests: `ProtocolTest` endpoint cases.
 - `android/.../link/Endpoint.kt:10-18` (no host validation); `SecureSocket.kt:48-53`; `BridgeClient.kt:89-125`; `BridgeService.kt:38` (scope with no `CoroutineExceptionHandler`)
 - **What**: Take `"pc name"` (a space) or `"fe80::1"`. `Endpoint.parse` accepts it, then `Request.Builder().url("ws://pc name:8765/")` throws
   `IllegalArgumentException` inside the `loop()` coroutine. Nothing catches it, so the process crashes. `START_STICKY` and
@@ -136,7 +142,8 @@ Severity: **H** high, **M** medium, **L** low.
 - **Fix**: Validate the host in `Endpoint.parse` (IPv4 or a DNS label pattern) and reject invalid input in the UI. Wrap
   `connectOnce` in `try/catch`, and give the service scope a `CoroutineExceptionHandler` that logs.
 
-### B2. M: A finished transfer whose `xfer_done` is lost is received again as a duplicate (both sides)
+### B2. M: A finished transfer whose `xfer_done` is lost is received again as a duplicate (both sides) (fixed)
+- **Status**: Fixed in step 11. Both sides keep completed transfer ids on disk for 24 h; a re-offer gets a full `have` and `xfer_done ok:true` without a data connection (PROTOCOL.md section 6.2). Tests: `test_files.py`, `CompletedIdsTest`.
 - Windows `link/transfer.py:313-351` (`_finish` with `peer is None`, state deleted); Android `link/Transfer.kt:211-219` (`complete` deletes state, then sends `done`)
 - **What**: If the control connection drops between the last range ending and `xfer_done`, the receiver has already moved or committed
   the file and forgotten the id. The sender re-offers the same id after reconnecting, as the spec says. The receiver treats it as new
@@ -145,7 +152,8 @@ Severity: **H** high, **M** medium, **L** low.
 - **Fix**: Keep a small "completed ids" record (id, size, final path, timestamp; prune it like partials). On a re-offer of a
   completed id, reply `xfer_accept` with every range having `have == length`, then `xfer_done ok:true` straight away. Add this to spec §6.2.
 
-### B3. M: Disk errors on a Windows data connection leave the transfer stuck, and the Android sender waits forever
+### B3. M: Disk errors on a Windows data connection leave the transfer stuck, and the Android sender waits forever (fixed)
+- **Status**: Fixed in step 11. Disk errors send `xfer_cancel` before closing the data connection; both sides cancel a transfer with no progress for 60 s (hashing counts as progress). Tests: `test_files.py`, `TransferCoreTest`.
 - Windows `link/transfer.py:508-546` (`serve_data` does not catch `OSError`); Android `Transfer.kt:153-165` (`reply.await()`/`done.await()` with no timeout)
 - **What**: If the disk is full or the `.part` is locked during `_write_at`, the error escapes to `_handle`. The data connection dies,
   `inc` stays in `_incoming`, and no `xfer_done` or `xfer_cancel` is sent. Android waits on `done` with no timeout, and the whole

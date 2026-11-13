@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import re
 import socket
@@ -14,12 +15,23 @@ log = logging.getLogger(__name__)
 
 SERVICE_TYPE = "_clipbridge._tcp.local."
 CHECK_INTERVAL = 30.0
+# 169.254/16 stays: devices on a router-less link (hotspot, direct cable) only have link-local addresses.
+_LAN_NETWORKS = tuple(
+    ipaddress.IPv4Network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")
+)
 
 
 def local_ipv4() -> list[str]:
-    """Usable IPv4 addresses of this machine (no loopback / link-local)."""
-    addrs = [a for a in get_all_addresses() if not a.startswith(("127.", "169.254."))]
-    return sorted(set(addrs))
+    """Private-network IPv4 addresses of this machine (RFC 1918 or link-local); never public or loopback."""
+    return sorted({a for a in get_all_addresses() if _is_private_lan(a)})
+
+
+def _is_private_lan(addr: str) -> bool:
+    try:
+        ip = ipaddress.IPv4Address(addr)
+    except ValueError:
+        return False
+    return any(ip in net for net in _LAN_NETWORKS)
 
 
 class Advertiser:

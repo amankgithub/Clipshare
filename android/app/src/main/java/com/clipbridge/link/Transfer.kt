@@ -23,6 +23,7 @@ import java.io.EOFException
 import java.io.IOException
 import java.io.InputStream
 import java.security.MessageDigest
+import kotlin.coroutines.CoroutineContext
 
 /**
  * File transfer service (PROTOCOL.md section 6.2), socket and disk side. Pure rules live in [TransferCore].
@@ -56,6 +57,8 @@ class Transfer(
         val onDone: (Boolean) -> Unit,
     ) {
         var retried = false
+        /** Monotonic time of the last reply or range progress; the offer is given up after [STALL_MS] without either. */
+        @Volatile var activeMs = 0L
         var reply = CompletableDeferred<JSONObject>()
         var done = CompletableDeferred<Outcome>()
     }
@@ -74,18 +77,22 @@ class Transfer(
     }
 
     /** One control connection's lifetime: its peer, credentials for data connections, and its workers. */
-    private class Link(val peer: Peer, val psk: ByteArray, val endpoint: Endpoint, parent: Job) {
-        val job = SupervisorJob(parent)
-        val scope = CoroutineScope(job + Dispatchers.IO)
+    private class Link(val peer: Peer, val psk: ByteArray, val endpoint: Endpoint, parent: CoroutineContext) {
+        val job = SupervisorJob(parent[Job])
+        /** Keeps the parent's context (its CoroutineExceptionHandler included), with its own job. */
+        val scope = CoroutineScope(parent + job + Dispatchers.IO)
         /** Sends and receives queue apart, so a large file in one direction never holds up the other. */
         val sends = Channel<RangeJob>(Channel.UNLIMITED)
         val recvs = Channel<RangeJob>(Channel.UNLIMITED)
     }
 
-    private val scope = CoroutineScope(SupervisorJob(parent.coroutineContext[Job]) + Dispatchers.IO)
+    /** The parent's context (its CoroutineExceptionHandler included) with a child supervisor job. */
+    private val scope = CoroutineScope(parent.coroutineContext + SupervisorJob(parent.coroutineContext[Job]) + Dispatchers.IO)
     private val lock = Any()
     private val outbox = ArrayDeque<Outgoing>()
     private val incoming = HashMap<String, Incoming>()
+    /** Loaded on first use (on an IO thread), guarded by [lock]. */
+    private val completed by lazy { store.loadCompleted(System.currentTimeMillis()) }
     private val wake = Channel<Unit>(Channel.CONFLATED)
     @Volatile private var link: Link? = null
     private var busy = 0
@@ -98,7 +105,7 @@ class Transfer(
     // -- link lifecycle (called by the control connection) ---------------------------------------
 
     fun onLinkUp(peer: Peer, psk: ByteArray, endpoint: Endpoint) {
-        val l = Link(peer, psk, endpoint, scope.coroutineContext[Job]!!)
+        val l = Link(peer, psk, endpoint, scope.coroutineContext)
         link = l
         repeat(TransferCore.STREAMS) {
             l.scope.launch { worker(l, l.sends) }
@@ -152,16 +159,39 @@ class Transfer(
     /** @return the outcome, or null if the link went away first. */
     private suspend fun offerOnce(l: Link, out: Outgoing): Outcome? {
         out.reply = CompletableDeferred(); out.done = CompletableDeferred()
+        out.activeMs = nowMs()
         if (!control(TransferCore.offerHeader(out.offer))) return null
-        val reply = out.reply.await()
+        val reply = awaitActive(out, out.reply) ?: return stalled(out)
         if (reply.optString("type") != "xfer_accept") {
             return if (reply.optString("type") == "xfer_reject") Outcome.REJECTED else Outcome.CANCELLED
         }
         val ranges = TransferCore.parseRanges(reply.opt("ranges"), out.offer.size)
         if (ranges == null) { control(TransferCore.cancel(out.offer.id)); return Outcome.CANCELLED }
         out.onProgress(ranges.sumOf { it.have })
-        ranges.forEach { l.sends.send(RangeJob.Send(out, it)) }
-        return out.done.await()
+        // A range the receiver already has in full needs no data connection (PROTOCOL.md 6.2).
+        ranges.filter { !it.complete }.forEach { l.sends.send(RangeJob.Send(out, it)) }
+        return awaitActive(out, out.done) ?: stalled(out)
+    }
+
+    /** [d]'s value, or null once nothing has moved on [out] for [STALL_MS]. */
+    private suspend fun <T : Any> awaitActive(out: Outgoing, d: CompletableDeferred<T>): T? {
+        while (true) {
+            @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+            if (d.isCompleted) return d.getCompleted() // arrived just as the timer ran out
+            val left = STALL_MS - (nowMs() - out.activeMs)
+            if (left <= 0) return null
+            val v = withTimeoutOrNull(left) { d.await() } ?: continue // range progress may have moved activeMs
+            out.activeMs = nowMs()
+            return v
+        }
+    }
+
+    /** The receiver went quiet: give the file up so the outbox moves on. */
+    private fun stalled(out: Outgoing): Outcome {
+        log("send ${out.offer.id.take(8)} stalled; cancelling")
+        control(TransferCore.cancel(out.offer.id))
+        out.done.complete(Outcome.CANCELLED) // a range waiting on the socket sees this and closes its connection
+        return Outcome.CANCELLED
     }
 
     // -- control messages from the peer ----------------------------------------------------------
@@ -190,6 +220,13 @@ class Transfer(
     // -- receiver side ---------------------------------------------------------------------------
 
     private suspend fun onOffer(l: Link, peer: Peer, offer: FileOffer) {
+        if (synchronized(lock) { completed.has(offer.id, peer.id, offer.size, System.currentTimeMillis()) }) {
+            // Already received; our xfer_done was lost with the connection. Confirm, do not receive again.
+            log("recv ${offer.id.take(8)} already complete; confirming")
+            control(TransferCore.accept(offer.id, TransferCore.fullRanges(offer.size)))
+            control(TransferCore.done(offer.id, true))
+            return
+        }
         synchronized(lock) { incoming.remove(offer.id) }?.over = true // repeated offer: start over from saved state
         val feature = router.fileFeature(offer.feature)
         val saved = store.load(offer.id)
@@ -213,10 +250,19 @@ class Transfer(
         inc.over = true
         synchronized(lock) { incoming.remove(inc.offer.id) }
         val ok = try { inc.sink.commit(); true } catch (e: Exception) { log("commit failed: ${e.javaClass.simpleName}"); false }
+        if (ok) remember(inc)
         store.delete(inc.offer.id)
         control(TransferCore.done(inc.offer.id, ok))
         if (ok) inc.feature.onFileReceived(inc.peer, inc.offer, inc.sink)
         else { runCatching { inc.sink.discard() }; inc.feature.onFileFailed(inc.peer, inc.offer) }
+    }
+
+    /** Record a completed id (PROTOCOL.md 6.2) so a re-offer after a lost `xfer_done` is confirmed, not received again. */
+    private fun remember(inc: Incoming) {
+        synchronized(lock) {
+            completed.add(inc.offer.id, inc.peer.id, inc.offer.size, System.currentTimeMillis())
+            try { store.saveCompleted(completed) } catch (e: IOException) { log("completed record not saved: ${e.javaClass.simpleName}") }
+        }
     }
 
     /** Drop [inc] and its partial file; [notifyPeer] is the message to send (`xfer_done ok:false`, `xfer_cancel`) or null. */
@@ -288,8 +334,8 @@ class Transfer(
         try {
             out.source.open().use { input ->
                 skipFully(input, r.start)
-                hashPrefix(input, r.have, sha)
-                if (!c.send(TransferCore.attach(out.offer.id, r.start))) return Result.BROKEN
+                hashPrefix(input, r.have, sha) { out.activeMs = nowMs() } // a long resume prefix is progress too
+                if (!c.send(TransferCore.attach(out.offer.id, r.start))) return closedBy(out)
                 var sent = 0L
                 val base = out.offer.size - r.length + r.have
                 coroutineScope {
@@ -297,14 +343,16 @@ class Transfer(
                     for (body in chunks) {
                         if (out.done.isCompleted) { chunks.cancel(); return@coroutineScope }
                         sha.update(body)
-                        while (c.isOpen && c.queued() > 2L * TransferCore.CHUNK) delay(5)
+                        while (c.isOpen && !out.done.isCompleted && c.queued() > 2L * TransferCore.CHUNK) delay(5)
+                        if (out.done.isCompleted) { chunks.cancel(); return@coroutineScope }
                         if (!c.send(TransferCore.data(), body)) { chunks.cancel(); return@coroutineScope }
                         sent += body.size
+                        out.activeMs = nowMs()
                         out.onProgress(base + sent)
                     }
                 }
                 if (out.done.isCompleted) return Result.ABORTED
-                if (!c.send(TransferCore.end(TransferCore.hex(sha.digest())))) return Result.BROKEN
+                if (!c.send(TransferCore.end(TransferCore.hex(sha.digest())))) return closedBy(out)
                 logRate("sent", sent, started)
                 return Result.OK
             }
@@ -316,6 +364,13 @@ class Transfer(
             return Result.ABORTED
         }
     }
+
+    /**
+     * The data connection closed under a send. A receiver that cannot go on sends `xfer_cancel` before
+     * closing (1000), so wait briefly for it: then the transfer is over, not the link.
+     */
+    private suspend fun closedBy(out: Outgoing): Result =
+        if (withTimeoutOrNull(CANCEL_GRACE_MS) { out.done.await() } != null) Result.ABORTED else Result.BROKEN
 
     /** Disk reads run ahead of the socket by two chunks. */
     private fun CoroutineScope.readAhead(input: InputStream, r: Range): ReceiveChannel<ByteArray> = produce(Dispatchers.IO, capacity = 2) {
@@ -334,6 +389,8 @@ class Transfer(
             var sinceSync = 0L
             while (true) {
                 val env = c.incoming.receiveCatching().getOrNull()
+                // A sender that cannot go on sends xfer_cancel before closing (1000): give it a moment to arrive.
+                if (env == null) withTimeoutOrNull(CANCEL_GRACE_MS) { while (!inc.over) delay(20) }
                 if (env == null || inc.over) { checkpoint(inc); return if (inc.over) Result.ABORTED else Result.BROKEN }
                 when (TransferCore.classify(env.header)) {
                     "data" -> {
@@ -395,7 +452,7 @@ class Transfer(
         }
     }
 
-    private fun hashPrefix(input: InputStream, len: Long, sha: MessageDigest) {
+    private fun hashPrefix(input: InputStream, len: Long, sha: MessageDigest, onBlock: () -> Unit) {
         val buf = ByteArray(minOf(TransferCore.CHUNK.toLong(), maxOf(len, 1)).toInt())
         var left = len
         while (left > 0) {
@@ -403,7 +460,9 @@ class Transfer(
             if (n < 0) throw EOFException()
             sha.update(buf, 0, n)
             left -= n
+            onBlock()
         }
+        onBlock()
     }
 
     private fun skipFully(input: InputStream, n: Long) {
@@ -470,5 +529,12 @@ class Transfer(
         private const val PROGRESS_MS = 500L
         /** Matches MediaStore's expiry of pending (unfinished) downloads. */
         private const val PARTIAL_MAX_AGE_MS = 7L * 24 * 3600 * 1000
+        /** A sender gives up on an offer that sees no reply and no range progress for this long (PROTOCOL.md 6.2). */
+        private const val STALL_MS = 60_000L
+        /** How long a closed data connection waits for the peer's `xfer_cancel` before counting as a broken link. */
+        private const val CANCEL_GRACE_MS = 2_000L
+
+        private fun nowMs(): Long = System.nanoTime() / 1_000_000
     }
 }
+

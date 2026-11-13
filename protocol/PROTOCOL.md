@@ -52,7 +52,10 @@ no line breaks. Decoders reject any other alphabet, missing padding, or wrong de
   must not send any encrypted frame before this check passes (a rogue server learns nothing).
 - The server may send encrypted frames immediately after `auth_ok`.
 - Timeout: the server closes **4408** if a valid `auth` has not arrived within 10 s of the
-  WebSocket opening. The client closes **4408** if `auth_ok` has not arrived within 10 s of sending `auth`.
+  WebSocket opening. The client closes **4408** if the handshake has not finished within 10 s of the
+  WebSocket opening (a server that never sends `challenge` cannot hold it).
+- The server handles at most **16** unauthenticated connections at once; more are closed **1013**
+  (try again later).
 - If a client authenticates a **control** connection with a `device` that already has a live
   control connection, the server closes the **older** one with **4409** (stale socket after a
   network change). Data connections never replace anything and are never replaced.
@@ -152,7 +155,7 @@ Moves one file of any size from the side that has it (**sender**) to the other s
 | `xfer_offer` | sender → receiver | `id`, `feature`, `name`, `size`, `meta` |
 | `xfer_accept` | receiver → sender | `id`, `ranges` |
 | `xfer_reject` | receiver → sender | `id` |
-| `xfer_done` | receiver → sender | `id`, `ok` |
+| `xfer_done` | receiver → sender | `id`, `ok` (also the answer to a re-offer of a completed `id`) |
 | `xfer_cancel` | either | `id` |
 
 - `id`: 32 lowercase hex characters (16 random bytes), chosen by the sender. A re-offer of the
@@ -166,12 +169,19 @@ Moves one file of any size from the side that has it (**sender**) to the other s
   range, of which the first `have` bytes are already on disk. For a new file `have` is 0. Ranges
   are sorted, do not overlap, and together cover `[0, size)`. The receiver chooses the split (one
   range, or up to one per data connection it wants); on a re-offer it repeats the same split with
-  updated `have`. A file of size 0 has `ranges = []`.
+  updated `have`. `have` equals the range length only in the answer to a completed `id` (below):
+  for an unfinished file a range already fully on disk is reported one byte short, so it still
+  ends with `xfer_end` and its hash is checked. A file of size 0 has `ranges = []`.
 - `ok`: `true` once every range has arrived and matched its hash and the file is in its final
   place; `false` on a hash mismatch (the receiver discards the partial file and all its state for
   that `id`). After `ok:false` the sender may offer the file once more with a new `id`.
 - `xfer_cancel`: both sides drop the transfer; the receiver deletes the partial file. The sender
-  stops streaming; open data connections for that `id` are closed (1000).
+  stops streaming; open data connections for that `id` are closed (1000). Either side sends it
+  when it cannot go on (the receiver cannot write to its storage, the sender cannot read the
+  file), on the control connection **before** it closes that transfer's data connection, so the
+  peer sees a cancelled transfer rather than a broken link. The sender gives up on a transfer,
+  with `xfer_cancel`, when nothing has moved on it for 60 s: no reply to its offer, no hashing of
+  a resume prefix, no range bytes accepted by the socket, and no `xfer_done`.
 - Messages with an unknown `id` → ignore.
 
 **Data connections** (subprotocol `clipbridge.data.v1`):
@@ -180,7 +190,9 @@ Moves one file of any size from the side that has it (**sender**) to the other s
   inbound connections). The client opens them after `xfer_accept` is sent or received, one per
   range it streams at a time.
 - The client's first frame on it is `{"ch":"link","type":"xfer_attach","id":"<id>","start":<start>}`,
-  naming one accepted range. The server replies nothing; unknown `id` or `start` → close **4404**.
+  naming one accepted range whose `have` is less than its length (a range the receiver already
+  has in full gets no data connection). The server replies nothing; unknown `id` or `start` →
+  close **4404**.
 - Then the **sender** of the file (client or server) sends, in order:
   - `{"ch":"link","type":"xfer_data"}` frames whose bodies are consecutive file bytes from
     `start + have` up to `end` (body 1 byte to 4 MiB each);
@@ -192,8 +204,15 @@ Moves one file of any size from the side that has it (**sender**) to the other s
   connection carries many ranges and files back to back), or close it (1000).
 - The receiver sends `xfer_done` on the control connection once every range of the file has ended.
 - If the control connection closes, both sides close that client's data connections. The sender
-  re-offers unfinished files after reconnecting; the receiver answers with its current `have`
-  values. How long a receiver keeps partial files of an unfinished `id` is its choice.
+  re-offers every file it has not seen `xfer_done` for after reconnecting; the receiver answers
+  with its current `have` values. How long a receiver keeps partial files of an unfinished `id` is
+  its choice.
+- The receiver remembers the `id`s it completed with `ok:true` in the last 24 h (with the
+  sender's device and `size`; a bounded number, kept in storage so a restart keeps them), because
+  that `xfer_done` may have been lost with the connection. A re-offer of a remembered `id` from the
+  same device with the same `size` is answered with
+  `xfer_accept` whose ranges all have `have` equal to their length, then at once `xfer_done`
+  `ok:true`; the file is not received or handed to the feature again.
 
 ## 7. Clipboard feature (`ch = "clipboard"`)
 
@@ -229,7 +248,8 @@ Image clip:
 ## 8. Size limits
 
 - Maximum plaintext (envelope) size: **16 MiB = 16 777 216 bytes**. Maximum WebSocket message:
-  16 777 216 + 28 bytes. Handshake messages: 4 KiB max.
+  16 777 216 + 28 bytes. Handshake messages: 4 KiB max, enforced per frame by both sides before
+  authentication (the 16 MiB limit applies only after `auth_ok`).
 - A sender must not send an envelope above the limit: skip it and log.
 - A receiver must reject larger messages; the WebSocket library closes with **1009**.
 
@@ -252,6 +272,7 @@ Image clip:
 | 1000 | Normal close | either |
 | 1001 | Going away (shutdown) | either |
 | 1009 | Message too big | either (library) |
+| 1013 | Try again later (too many connections still in the handshake) | server |
 | 4400 | Protocol violation (malformed/unexpected handshake message, text frame after handshake) | either |
 | 4401 | Authentication failed (bad MAC). Reason always empty | either |
 | 4402 | Frame integrity failure (bad length, nonce padding, counter, or GCM tag) | either |

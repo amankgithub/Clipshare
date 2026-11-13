@@ -26,6 +26,7 @@ import com.clipbridge.link.PartialStore
 import com.clipbridge.link.Status
 import com.clipbridge.link.TransferLock
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -35,7 +36,10 @@ import kotlinx.coroutines.launch
 
 /** Foreground service (connectedDevice): composition root. Owns link + features. */
 class BridgeService : Service() {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.Default +
+            CoroutineExceptionHandler { _, e -> Log.e(TAG, "uncaught ${e.javaClass.simpleName}") },
+    )
     private lateinit var settings: Settings
     private lateinit var discovery: Discovery
     private lateinit var network: NetworkWatcher

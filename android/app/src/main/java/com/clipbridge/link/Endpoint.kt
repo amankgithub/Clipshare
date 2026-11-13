@@ -6,14 +6,17 @@ data class Endpoint(val host: String, val port: Int = DEFAULT_PORT) {
     companion object {
         const val DEFAULT_PORT = 8765
 
-        /** "host" or "host:port"; null if blank/invalid. */
+        private val HOST = Regex("[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?")
+
+        /** "host" or "host:port" (IPv4 or DNS name; IPv6 literals are not supported); null if blank/invalid. */
         fun parse(s: String?): Endpoint? {
             val t = s?.trim().orEmpty()
             if (t.isEmpty()) return null
-            val i = t.lastIndexOf(':')
-            if (i < 0) return Endpoint(t)
-            val port = t.substring(i + 1).toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
-            val host = t.substring(0, i).takeIf { it.isNotEmpty() } ?: return null
+            val parts = t.split(':')
+            if (parts.size > 2) return null
+            val host = parts[0].takeIf { HOST.matches(it) } ?: return null
+            if (parts.size == 1) return Endpoint(host)
+            val port = parts[1].takeIf { p -> p.all { it in '0'..'9' } }?.toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
             return Endpoint(host, port)
         }
 

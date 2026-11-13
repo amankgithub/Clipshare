@@ -112,7 +112,12 @@ class BridgeClient(
         _status.value = Status(LinkState.CONNECTING, ep.toString())
         val s = SecureSocket(scope, psk, deviceId, ep, SUBPROTOCOL, onReady = { onReady(it, psk) }, onPlaintext = { _, p -> onPlaintext(p) }, log = log)
         session = s
-        s.open(http)
+        try {
+            s.open(http)
+        } catch (e: IllegalArgumentException) {
+            log("bad endpoint"); session = null
+            return false
+        }
         val authed = s.closed.await()
         session = null
         receipts.failAll()

@@ -141,6 +141,79 @@ def parse_ranges(raw: object, size: int) -> list[Range] | None:
     return ranges if pos == size else None
 
 
+def full_ranges(size: int) -> list[Range]:
+    """The split of a file the receiver already completed (`have` = length everywhere)."""
+    return [Range(r.start, r.end, r.length) for r in split(size)]
+
+
+def rewind_full(ranges: list[Range]) -> None:
+    """Before resuming an unfinished file: a range fully on disk is not yet verified, so report it
+    one byte short; the sender then streams that byte and `xfer_end`, and the hash is checked."""
+    for r in ranges:
+        r.have = min(r.have, r.length - 1)
+
+
+# -- completed ids -------------------------------------------------------------
+
+COMPLETED_MAX = 256
+COMPLETED_MAX_AGE = 24 * 3600.0
+
+
+@dataclass(frozen=True)
+class _Completed:
+    device: str
+    size: int
+    at: float
+
+
+class CompletedIds:
+    """Ids this receiver finished with `ok:true`, so a re-offer after a lost `xfer_done` is
+    answered `ok:true` again instead of being received twice. Bounded by count and age; times are
+    wall-clock seconds so the record can be saved and reloaded (`to_json` / `from_json`)."""
+
+    def __init__(self, max_items: int = COMPLETED_MAX, max_age: float = COMPLETED_MAX_AGE) -> None:
+        self._max_items = max_items
+        self._max_age = max_age
+        self._items: dict[str, _Completed] = {}  # insertion order = completion order
+
+    def add(self, fid: str, device: str, size: int, now: float) -> None:
+        self._items.pop(fid, None)
+        self._items[fid] = _Completed(device, size, now)
+        self._prune(now)
+
+    def has(self, fid: str, device: str, size: int, now: float) -> bool:
+        self._prune(now)
+        item = self._items.get(fid)
+        return item is not None and item.device == device and item.size == size
+
+    def _prune(self, now: float) -> None:
+        while self._items:
+            oldest = next(iter(self._items))
+            if len(self._items) <= self._max_items and now - self._items[oldest].at <= self._max_age:
+                break
+            del self._items[oldest]
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def to_json(self) -> list[list[Any]]:
+        return [[fid, c.device, c.size, c.at] for fid, c in self._items.items()]
+
+    @classmethod
+    def from_json(cls, raw: object, now: float) -> "CompletedIds":
+        """Rebuild from `to_json` output; malformed entries are skipped."""
+        ids = cls()
+        for item in raw if isinstance(raw, list) else []:
+            if not isinstance(item, list) or len(item) != 4:
+                continue
+            fid, device, size, at = item
+            if valid_id(fid) and isinstance(device, str) and _is_int(size) and isinstance(at, (int, float)):
+                ids._items[fid] = _Completed(device, size, float(at))
+        ids._items = dict(sorted(ids._items.items(), key=lambda kv: kv[1].at))
+        ids._prune(now)
+        return ids
+
+
 def accept(fid: str, ranges: list[Range]) -> dict[str, Any]:
     return {"ch": LINK_CH, "type": "xfer_accept", "id": fid, "ranges": [r.to_wire() for r in ranges]}
 

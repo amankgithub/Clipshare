@@ -66,3 +66,19 @@ debug APK built from the step 13 commit.
 
 Observed: while rejected (19, 20) the phone was dialling the PC's link-local address `169.254.171.177`, which the PC
 advertises alongside its LAN address (on purpose, for router-less links); see "Known bugs" in `docs/PLAN.md`.
+
+## Automated device run (step 14, 2026-11-16)
+`windows/e2e/device.py` (full sizes, no `--pairing`), same setup, debug APK and PC server from the step 14 commit.
+All scenarios not listed here: PASS, as in step 13.
+
+| # | Scenario | Result | Notes |
+|---|---|---|---|
+| 2 | PC→phone 1 GB | PASS | 9.0 MB/s |
+| 9 | Small file during a big one, opposite directions | PASS | big proven in flight before and after the small file, both directions |
+| 12 | Small during big, same direction | PASS | `--only 12`; small transfer started while the 1 GB one was still running |
+| 16 | PC clip right after the phone vanished | PASS | the clip set while the PC still held the dead peer arrived after reconnect |
+| 16b | Offline clip flush | PASS | only the latest offline clip arrived; reconnect 4.2 s |
+
+Gotcha: `Start-ScheduledTask ClipBridge` does nothing while the task is already running, so the first full run's
+scenarios 1-12 hit the old server (12 failed as FIFO) until scenario 13 restarted it. Stop the `clipbridge run`
+processes first, then start the task.

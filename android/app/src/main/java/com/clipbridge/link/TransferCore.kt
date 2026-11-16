@@ -26,8 +26,10 @@ data class Range(val start: Long, val end: Long, var have: Long = 0) {
 data class PartialState(val offer: FileOffer, val token: String, val ranges: List<Range>, val updatedMs: Long)
 
 object TransferCore {
-    /** Data connections at once; raised only if the benchmark shows a gain. */
+    /** Data connections (ranges) per file; raised only if the benchmark shows a gain. */
     const val STREAMS = 1
+    /** Files in flight per peer and direction (PROTOCOL.md 6.3): offered together and sent or received on separate data connections. */
+    const val FILES_IN_FLIGHT = 3
     /** Max `xfer_data` body. */
     const val CHUNK = 4 * 1024 * 1024
 

@@ -30,10 +30,10 @@ import kotlin.coroutines.CoroutineContext
  *
  * - Control messages go over the control connection via [control]; the client (this side) dials every
  *   data connection, whichever side sends the file.
- * - Outgoing files wait in an in-memory FIFO and are offered one at a time; an unfinished file is
- *   re-offered with the same `id` after a reconnect.
- * - Range work runs on [TransferCore.STREAMS] workers per direction (send, receive) per control connection,
- *   each keeping one data connection open while there is work.
+ * - Outgoing files wait in an in-memory FIFO; up to [TransferCore.FILES_IN_FLIGHT] are offered at once and the
+ *   rest wait their turn. An unfinished file is re-offered with the same `id` after a reconnect.
+ * - Range work runs on [TransferCore.FILES_IN_FLIGHT] workers per direction (send, receive) per control connection,
+ *   each keeping one data connection open while there is work, so a small file never waits behind a big one.
  * - Received ranges are checkpointed (synced bytes + state file) so a reconnect resumes them.
  */
 class Transfer(
@@ -56,10 +56,12 @@ class Transfer(
         val onDone: (Boolean) -> Unit,
     ) {
         var retried = false
+        /** Being offered on the current link; guarded by [Transfer.lock]. */
+        var sending = false
         /** Monotonic time of the last reply or range progress; the offer is given up after [STALL_MS] without either. */
         @Volatile var activeMs = 0L
-        var reply = CompletableDeferred<JSONObject>()
-        var done = CompletableDeferred<Outcome>()
+        @Volatile var reply = CompletableDeferred<JSONObject>()
+        @Volatile var done = CompletableDeferred<Outcome>()
     }
 
     private class Incoming(val peer: Peer, val offer: FileOffer, val feature: FileFeature, val sink: FileSink, val ranges: List<Range>) {
@@ -106,7 +108,7 @@ class Transfer(
     fun onLinkUp(peer: Peer, pairing: Pairing, endpoint: Endpoint) {
         val l = Link(peer, pairing, endpoint, scope.coroutineContext)
         link = l
-        repeat(TransferCore.STREAMS) {
+        repeat(TransferCore.FILES_IN_FLIGHT) {
             l.scope.launch { worker(l, l.sends) }
             l.scope.launch { worker(l, l.recvs) }
         }
@@ -133,18 +135,33 @@ class Transfer(
 
     private suspend fun sendLoop() {
         while (scope.isActive) {
-            val out = synchronized(lock) { outbox.firstOrNull() }
             val l = link
+            val out = synchronized(lock) {
+                if (l == null || outbox.count { it.sending } >= TransferCore.FILES_IN_FLIGHT) null
+                else outbox.firstOrNull { !it.sending }?.also { it.sending = true }
+            }
             if (out == null || l == null) { wake.receive(); continue }
+            scope.launch {
+                try { sendOne(l, out) } finally {
+                    synchronized(lock) { out.sending = false }
+                    wake.trySend(Unit) // a slot is free, or the link was lost and the file waits for the next one
+                }
+            }
+        }
+    }
+
+    /** Offer [out] until it is finished; returns early if the link goes away (it is re-offered with the same id on the next one). */
+    private suspend fun sendOne(l: Link, out: Outgoing) {
+        while (true) {
             val attempt = l.scope.async { offerOnce(l, out) }
             val outcome = try { attempt.await() } catch (e: CancellationException) { if (!scope.isActive) throw e; null }
             when (outcome) {
-                null -> l.job.join() // link lost: wait for the next one, then re-offer with the same id
-                Outcome.CORRUPT -> if (out.retried) finish(out, false) else {
+                null -> return l.job.join() // wait out the old link's workers (and a failed control send) before this file is re-offered
+                Outcome.CORRUPT -> if (out.retried) return finish(out, false) else {
                     out.retried = true
                     out.offer = out.offer.copy(id = TransferCore.newId())
                 }
-                else -> finish(out, outcome == Outcome.DELIVERED)
+                else -> return finish(out, outcome == Outcome.DELIVERED)
             }
         }
     }
@@ -205,7 +222,7 @@ class Transfer(
             return
         }
         val id = h.optString("id")
-        val out = synchronized(lock) { outbox.firstOrNull()?.takeIf { it.offer.id == id } }
+        val out = synchronized(lock) { outbox.firstOrNull { it.sending && it.offer.id == id } }
         when (type) {
             "xfer_accept", "xfer_reject" -> out?.reply?.complete(h)
             "xfer_done" -> out?.done?.complete(if (h.optBoolean("ok")) Outcome.DELIVERED else Outcome.CORRUPT)

@@ -7,15 +7,14 @@ bytes run on worker threads so the event loop (and every clipboard message) neve
 Receiving: `<id>.part` (preallocated) and `<id>.json` (offer, destination, ranges with `have`)
 under the partial directory, plus `completed.json` (recently completed ids); the `.part` is renamed to the feature's destination once every
 range hash matched, and its id is remembered (`CompletedIds`) so a re-offer after a lost
-`xfer_done` is confirmed instead of received twice. A storage error cancels the transfer. Sending: an in-memory FIFO per device, one file at a time (`STREAMS`), whose
-unfinished head is re-offered with the same id after a reconnect, and given up (`xfer_cancel`)
-once nothing has moved on it for `STALL_TIMEOUT`.
+`xfer_done` is confirmed instead of received twice. A storage error cancels the transfer. Sending: up to `FILES_IN_FLIGHT` files per device are offered at once, further files wait in order
+(in memory); every unfinished offered file is re-offered with the same id after a reconnect, and
+given up (`xfer_cancel`) once nothing has moved on it for `STALL_TIMEOUT`.
 """
 
 from __future__ import annotations
 
 import asyncio
-import collections
 import dataclasses
 import hashlib
 import json
@@ -133,8 +132,9 @@ class TransferService:
         self._dir = partial_dir
         self._incoming: dict[str, Incoming] = {}
         self._outgoing: dict[str, Outgoing] = {}  # offers currently out, by id
-        self._queues: dict[str, collections.deque[Outgoing]] = {}
-        self._workers: dict[str, asyncio.Task[None]] = {}
+        self._slots: dict[str, asyncio.Semaphore] = {}  # per device: files in flight (FIFO waiters)
+        self._online: dict[str, asyncio.Event] = {}  # per device: set when a control connection is up
+        self._senders: dict[asyncio.Task[None], Outgoing] = {}  # one task per file sent or waiting
         self._data_conns: dict[str, set[Peer]] = {}
         self._completed = self._load_completed()
 
@@ -153,16 +153,15 @@ class TransferService:
                 log.warning("could not prune %s", path.name)
 
     async def stop(self) -> None:
-        for task in self._workers.values():
+        for task, item in list(self._senders.items()):
             task.cancel()
-        for queue in self._queues.values():
-            for item in queue:
-                if not item.result.done():
-                    item.result.set_result(False)
+            if not item.result.done():
+                item.result.set_result(False)
 
     async def on_peer_connected(self, peer: Peer) -> None:
-        if self._queues.get(peer.device):
-            self._ensure_worker(peer.device)
+        online = self._online.get(peer.device)
+        if online is not None:
+            online.set()
 
     async def on_peer_disconnected(self, peer: Peer) -> None:
         if self._peer_for(peer.device) is None:  # not replaced by a newer control connection
@@ -448,29 +447,33 @@ class TransferService:
             return False
         offer = FileOffer(os.urandom(16).hex(), feature, core.safe_name(path.name), size, meta or {})
         item = Outgoing(offer, peer.device, path, asyncio.get_running_loop().create_future())
-        self._queues.setdefault(peer.device, collections.deque()).append(item)
         log.info("queued %s (%d bytes) for %s", offer.id[:8], size, peer.device)
-        self._ensure_worker(peer.device)
+        task = asyncio.create_task(self._run_file(item))  # created in call order: slots are granted in that order
+        self._senders[task] = item
+        task.add_done_callback(self._senders.pop)
         return await item.result
 
-    def _ensure_worker(self, device: str) -> None:
-        task = self._workers.get(device)
-        if task is None or task.done():
-            self._workers[device] = asyncio.create_task(self._run_queue(device))
-
-    async def _run_queue(self, device: str) -> None:
-        queue = self._queues[device]
-        while queue:
-            item = queue[0]
-            peer = self._peer_for(device)
-            if peer is None:
-                return  # on_peer_connected restarts us
-            result = await self._offer(peer, item)
-            if result is None:  # link lost: re-offer the same id on the next connection
-                if self._peer_for(device) is peer:
-                    await asyncio.sleep(1.0)
-                continue
-            queue.popleft()
+    async def _run_file(self, item: Outgoing) -> None:
+        """Wait for a free slot of the device, then offer until settled (re-offering after a lost link)."""
+        device = item.device
+        slots = self._slots.setdefault(device, asyncio.Semaphore(core.FILES_IN_FLIGHT))
+        online = self._online.setdefault(device, asyncio.Event())
+        result = False
+        try:
+            async with slots:
+                while True:
+                    peer = self._peer_for(device)
+                    if peer is None:
+                        online.clear()
+                        await online.wait()  # on_peer_connected sets it
+                        continue
+                    outcome = await self._offer(peer, item)
+                    if outcome is not None:
+                        result = outcome
+                        break
+                    if self._peer_for(device) is peer:  # link lost: re-offer the same id on the next connection
+                        await asyncio.sleep(1.0)
+        finally:
             if not item.result.done():
                 item.result.set_result(result)
 

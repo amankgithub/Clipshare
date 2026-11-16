@@ -15,6 +15,7 @@ from typing import Any
 from clipbridge.link.envelope import LINK_CH
 
 STREAMS = 1  # data connections per transfer; raised only if the benchmark shows a gain
+FILES_IN_FLIGHT = 3  # files per device offered at once (PROTOCOL.md 6.3); more wait in order
 CHUNK = 4 * 1024 * 1024  # max xfer_data body
 
 _ID = re.compile(r"[0-9a-f]{32}")

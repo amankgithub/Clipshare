@@ -4,6 +4,7 @@ import com.clipbridge.link.Feature
 import com.clipbridge.link.LinkSender
 import com.clipbridge.link.Peer
 import com.clipbridge.link.Reply
+import com.clipbridge.link.Response
 import android.util.Log
 import org.json.JSONObject
 
@@ -76,12 +77,13 @@ class ClipboardFeature(
     }
 
     private fun send(clip: Clip, onDelivered: ((Boolean) -> Unit)? = null) {
+        val sentAt = engine.connects
         when (clip) {
             is Clip.Text -> {
                 logClip("send ${describe(clip)}")
                 val h = JSONObject().put("ch", name).put("type", "clip").put("kind", "text")
                     .put("data", clip.text).put("ts", System.currentTimeMillis())
-                sender.send(null, h)
+                sender.send(null, h) { reply -> onReceipt(clip, sentAt, reply, onDelivered) }
             }
             is Clip.Image -> {
                 if (clip.png.size > ImageUtil.MAX_BYTES - 1024) {
@@ -90,13 +92,23 @@ class ClipboardFeature(
                 logClip("send ${describe(clip)}")
                 val h = JSONObject().put("ch", name).put("type", "clip").put("kind", "image")
                     .put("mime", "image/png").put("ts", System.currentTimeMillis())
-                sender.send(null, h, clip.png) { reply ->
-                    val ok = reply?.ok == true
-                    logClip("image delivered=$ok")
-                    onDelivered?.invoke(ok)
-                }
+                sender.send(null, h, clip.png) { reply -> onReceipt(clip, sentAt, reply, onDelivered) }
             }
         }
+    }
+
+    /**
+     * No reply (timeout, link closed) re-parks the clip; a reply with ok=false means the peer got it and failed, so it
+     * is not retried. If the link already reconnected, the clip is resent now instead of waiting for the next connect.
+     */
+    private fun onReceipt(clip: Clip, sentAt: Int, reply: Response?, onDelivered: ((Boolean) -> Unit)?) {
+        val ok = reply?.ok == true
+        logClip("${describe(clip)} delivered=$ok")
+        if (reply == null) {
+            val connected = synchronized(peers) { peers.isNotEmpty() }
+            engine.onUndelivered(clip, sentAt, connected)?.let { send(it) }
+        }
+        onDelivered?.invoke(ok)
     }
 
     private fun describe(clip: Clip): String = when (clip) {

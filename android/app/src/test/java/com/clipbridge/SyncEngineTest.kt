@@ -95,4 +95,30 @@ class SyncEngineTest {
         assertEquals(Local.Hold, e.onLocal(img(5), false))
         assertEquals(img(5), e.onConnected())
     }
+
+    @Test fun undeliveredClipStaysPendingOnlyIfStillCurrent() {
+        val e = SyncEngine()
+        e.onLocal(t("a"), connected = true)
+        assertNull(e.onUndelivered(t("a"), e.connects, connected = true))
+        assertEquals(t("a"), e.onConnected())
+        assertNull(e.onConnected())
+        e.onLocal(t("b"), connected = true)
+        assertNull(e.onUndelivered(t("a"), e.connects, true)) // stale
+        assertNull(e.onConnected())
+        assertNull(e.onUndelivered(t("b"), e.connects, true))
+        e.onRemote(t("c")) // newer remote clears it
+        assertNull(e.onConnected())
+    }
+
+    @Test fun lateFailureAfterReconnectIsReturnedForImmediateSend() {
+        val e = SyncEngine()
+        e.onLocal(t("a"), connected = true)
+        val sentAt = e.connects
+        e.onConnected() // link came back before the failure was known
+        assertEquals(t("a"), e.onUndelivered(t("a"), sentAt, connected = true))
+        assertNull(e.onConnected()) // not also parked
+        e.onLocal(t("b"), connected = true)
+        assertNull(e.onUndelivered(t("b"), e.connects - 1, connected = false)) // parked: link is down again
+        assertEquals(t("b"), e.onConnected())
+    }
 }

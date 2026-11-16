@@ -401,6 +401,46 @@ async def test_send_file_reoffered_after_reconnect(env: Env, tmp_path: Path) -> 
     assert await asyncio.wait_for(result, 5) is False
 
 
+async def test_small_file_sent_after_big_one_finishes_first(env: Env, tmp_path: Path) -> None:
+    big, small = tmp_path / "big.bin", tmp_path / "small.txt"
+    big.write_bytes(os.urandom(9 * 1024 * 1024))
+    small.write_bytes(b"small")
+    phone = await env.phone()
+    big_result = asyncio.ensure_future(env.files.send(big))
+    small_result = asyncio.ensure_future(env.files.send(small))
+    offers = {o["name"]: o for o in [await recv(phone), await recv(phone)]}  # both are offered at once
+    assert set(offers) == {"big.bin", "small.txt"}
+    for o in offers.values():
+        await phone.send({"ch": "link", "type": "xfer_accept", "id": o["id"], "ranges": [[0, o["size"], 0]]})
+    big_data = await env.data()  # the big file is mid-transfer: attached, bytes flowing, never finished
+    await big_data.send({"ch": "link", "type": "xfer_attach", "id": offers["big.bin"]["id"], "start": 0})
+    assert (await asyncio.wait_for(big_data.recv(), 10))[0]["type"] == "xfer_data"
+    small_data = await env.data()
+    await small_data.send({"ch": "link", "type": "xfer_attach", "id": offers["small.txt"]["id"], "start": 0})
+    assert (await asyncio.wait_for(small_data.recv(), 10))[1] == b"small"
+    assert (await asyncio.wait_for(small_data.recv(), 10))[0]["type"] == "xfer_end"
+    await phone.send({"ch": "link", "type": "xfer_done", "id": offers["small.txt"]["id"], "ok": True})
+    assert await asyncio.wait_for(small_result, 5) is True
+    assert not big_result.done()
+
+
+async def test_files_wait_in_order_beyond_three_in_flight(env: Env, tmp_path: Path) -> None:
+    phone = await env.phone()
+    results = []
+    for n in range(4):
+        src = tmp_path / f"f{n}.bin"
+        src.write_bytes(b"x" * 100)
+        results.append(asyncio.ensure_future(env.files.send(src)))
+        await asyncio.sleep(0)  # fix the order they were handed in
+    first = [await recv(phone) for _ in range(3)]
+    assert [o["name"] for o in first] == ["f0.bin", "f1.bin", "f2.bin"]
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(recv(phone), 0.3)  # the fourth waits for a free slot
+    await phone.send({"ch": "link", "type": "xfer_reject", "id": first[1]["id"]})
+    assert (await recv(phone))["name"] == "f3.bin"
+    assert await asyncio.wait_for(results[1], 5) is False
+
+
 async def test_send_empty_file(env: Env, tmp_path: Path) -> None:
     src = tmp_path / "e.txt"
     src.write_bytes(b"")

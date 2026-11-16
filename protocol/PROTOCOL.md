@@ -236,6 +236,9 @@ control connection. Files are never relayed to other clients.
   with `xfer_cancel`, when nothing has moved on it for 60 s: no reply to its offer, no hashing of
   a resume prefix, no range bytes accepted by the socket, and no `xfer_done`.
 - Messages with an unknown `id` → ignore.
+- A sender should have up to **3** files per peer in flight at once (offered, not yet ended by
+  `xfer_done`, `xfer_reject` or `xfer_cancel`), so a small file never waits for a large one to
+  finish; further files wait in order. A receiver handles any number.
 
 **Data connections** (subprotocol `clipbridge.data.v1`):
 
@@ -280,6 +283,9 @@ Text clip (v1):
 - The server relays every accepted clip to all other clients whose `hello` lists `clipboard`.
 - Echo/loop suppression is local state (SHA-256 of the text's UTF-8 bytes); see `SyncEngine` in
   `docs/PLAN.md`. Nothing about it is on the wire.
+- Delivery (informative): clips are sent as requests (section 6.2). A clip that is not delivered
+  (no reply, or the connection closed first) stays that peer's pending clip, the latest one only,
+  and is sent again when the peer reconnects.
 
 Image clip:
 

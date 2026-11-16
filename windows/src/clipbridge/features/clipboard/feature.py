@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import os
 import time
@@ -61,6 +62,10 @@ class ClipboardFeature:
         self._write_image = write_image
         self._engine = engine or SyncEngine()
         self._save_dir = save_dir
+        self._pending: dict[str, Clip] = {}  # device -> latest clip that device did not acknowledge
+        self._latest: dict[str, int] = {}  # device -> seq of the newest clip sent to it
+        self._seq = itertools.count(1)
+        self._tasks: set[asyncio.Future[None]] = set()
 
     @staticmethod
     def _wire(clip: Clip) -> tuple[dict[str, Any], bytes]:
@@ -78,8 +83,34 @@ class ClipboardFeature:
         return clip.kind == "image" and len(clip.data) + 256 > MAX_PLAINTEXT
 
     async def _send_all(self, clip: Clip, exclude: Peer | None = None) -> None:
+        for peer in self._link.peers:
+            if peer is not exclude and peer.supports(self.name):
+                self._deliver_later(peer, clip)
+
+    def _deliver_later(self, peer: Peer, clip: Clip) -> None:
+        """Send `clip` to `peer` as a request in the background; keep it pending if undelivered."""
+        self._pending.pop(peer.device, None)  # a newer clip replaces the pending one
+        seq = next(self._seq)
+        self._latest[peer.device] = seq
+        task = asyncio.ensure_future(self._deliver(peer, clip, seq))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _deliver(self, peer: Peer, clip: Clip, seq: int) -> None:
         header, body = self._wire(clip)
-        await self._link.broadcast(header, body, exclude=exclude)
+        try:
+            reply = await self._link.request(peer, header, body)
+        except Exception:
+            log.exception("clip request to %s failed", peer.device)
+            reply = None
+        if reply is not None or self._latest.get(peer.device) != seq:  # delivered, or superseded
+            return
+        for current in self._link.peers:  # the device already reconnected: send there now
+            if current is not peer and current.device == peer.device and current.supports(self.name):
+                self._deliver_later(current, clip)
+                return
+        self._pending[peer.device] = clip
+        log.info("clip not delivered to %s, kept for reconnect", peer.device)
 
     async def on_local_text(self, text: str) -> None:
         """Local clipboard changed (must run on the event loop)."""
@@ -110,10 +141,10 @@ class ClipboardFeature:
     async def on_peer_connected(self, peer: Peer) -> None:
         if not peer.supports(self.name):
             return
-        pending = self._engine.take_pending()
+        undelivered = self._pending.pop(peer.device, None)
+        pending = self._engine.take_pending() or undelivered
         if pending is not None:
-            header, body = self._wire(pending)
-            await self._link.send(peer, header, body)
+            self._deliver_later(peer, pending)
 
     async def on_peer_disconnected(self, peer: Peer) -> None:
         return None

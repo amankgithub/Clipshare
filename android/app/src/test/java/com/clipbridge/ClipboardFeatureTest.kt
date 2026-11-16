@@ -150,6 +150,63 @@ class ClipboardFeatureTest {
         assertEquals(listOf(false), got)
     }
 
+    @Test fun undeliveredTextIsResentOnNextConnectAndDeliveredIsNot() {
+        feature.onPeerConnected(peer)
+        feature.onLocalClip("a")
+        sender.sent[0].onReply!!(null) // timeout / connection closed
+        feature.onPeerDisconnected(peer)
+        feature.onPeerConnected(peer)
+        assertEquals("a", sender.sent[1].header.getString("data"))
+        sender.sent[1].onReply!!(Response(true))
+        feature.onPeerDisconnected(peer)
+        feature.onPeerConnected(peer)
+        assertEquals(2, sender.sent.size)
+    }
+
+    @Test fun undeliveredTextKeepsOnlyTheLatestAndNewerRemoteClears() {
+        feature.onPeerConnected(peer)
+        feature.onLocalClip("a")
+        feature.onLocalClip("b")
+        sender.sent[0].onReply!!(Response.FAILED) // stale: b is the current clip
+        sender.sent[1].onReply!!(null)
+        feature.onPeerDisconnected(peer)
+        feature.onPeerConnected(peer)
+        assertEquals("b", sender.sent[2].header.getString("data"))
+        sender.sent[2].onReply!!(null)
+        feature.onMessage(peer, clip("text") { put("data", "remote") }, ByteArray(0))
+        feature.onPeerDisconnected(peer)
+        feature.onPeerConnected(peer)
+        assertEquals(3, sender.sent.size)
+    }
+
+    @Test fun failedReplyIsNotRetried() {
+        feature.onPeerConnected(peer)
+        feature.onLocalClip("a")
+        sender.sent[0].onReply!!(Response.FAILED) // peer got it and failed
+        feature.onPeerDisconnected(peer)
+        feature.onPeerConnected(peer)
+        assertEquals(1, sender.sent.size)
+    }
+
+    @Test fun lateFailureAfterReconnectResendsNow() {
+        feature.onPeerConnected(peer)
+        feature.onLocalClip("a")
+        feature.onPeerDisconnected(peer)
+        feature.onPeerConnected(peer) // nothing pending yet
+        assertEquals(1, sender.sent.size)
+        sender.sent[0].onReply!!(null) // old link's failure arrives late
+        assertEquals("a", sender.sent[1].header.getString("data"))
+    }
+
+    @Test fun undeliveredImageIsResentOnNextConnect() {
+        feature.onPeerConnected(peer)
+        feature.onLocalImage(png)
+        sender.sent[0].onReply!!(null)
+        feature.onPeerDisconnected(peer)
+        feature.onPeerConnected(peer)
+        assertArrayEquals(png, sender.sent[1].body)
+    }
+
     @Test fun bugMalformedClipRequestIsAnsweredOkTrue() {
         expectBug("a malformed clip request gets a delivery receipt (ok:true) although nothing was applied") {
             val router = FeatureRouter().also { it.register(feature) }

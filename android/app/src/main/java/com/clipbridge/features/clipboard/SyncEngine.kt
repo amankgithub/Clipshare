@@ -46,9 +46,26 @@ class SyncEngine {
         return true
     }
 
+    /** Count of [onConnected] calls; a send remembers it to tell whether the link reconnected before its failure was known. */
+    @get:Synchronized
+    var connects = 0
+        private set
+
+    /**
+     * A sent clip got no delivery receipt ([sentAt] = [connects] when it was sent). Unless a newer clip replaced it:
+     * if the link reconnected since and is [connected], @return the clip to send now; otherwise park it for the next connect.
+     */
+    @Synchronized
+    fun onUndelivered(clip: Clip, sentAt: Int, connected: Boolean): Clip? {
+        if (hash(clip) != lastHash || pending != null) return null
+        if (connected && sentAt != connects) return clip
+        pending = clip
+        return null
+    }
+
     /** On (re)connect: flush the pending clip only; never push full state. */
     @Synchronized
-    fun onConnected(): Clip? = pending.also { pending = null }
+    fun onConnected(): Clip? { connects++; return pending.also { pending = null } }
 
     companion object {
         fun hash(clip: Clip): String = when (clip) {

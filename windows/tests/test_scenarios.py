@@ -334,8 +334,6 @@ class Scenario:
     number: int
     title: str
     run: Callable[[Ctx], Awaitable[None]]
-    xfail: str = ""  # a real product bug this scenario exposes
-    raises: tuple[type[BaseException], ...] = (AssertionError,)  # the only failure that counts as that bug
 
 
 SCENARIOS = [
@@ -348,9 +346,7 @@ SCENARIOS = [
     Scenario(8, "clips both ways during a phone-to-PC transfer", s8_clips_during_transfer_phone_to_pc),
     Scenario(8, "clips both ways during a PC-to-phone transfer", s8_clips_during_transfer_pc_to_phone),
     Scenario(9, "small file during a big phone-to-PC transfer", s9_small_file_during_big_phone_to_pc),
-    Scenario(9, "small file during a big PC-to-phone transfer", s9_small_file_during_big_pc_to_phone,
-             xfail="PC->phone sends run one file at a time per device (transfer.py STREAMS FIFO), so a small file waits behind a big one; fixed in PLAN.md step 14 (streams)",
-             raises=(asyncio.TimeoutError, TimeoutError)),
+    Scenario(9, "small file during a big PC-to-phone transfer", s9_small_file_during_big_pc_to_phone),
     Scenario(10, "data connection dropped mid-range resumes from have", s10_resume_after_data_connection_drop),
 ]
 
@@ -370,12 +366,9 @@ def folder_hashes(folder: Path) -> dict[str, str]:
     return {p.name: sha(p.read_bytes()) for p in folder.iterdir()} if folder.is_dir() else {}
 
 
-@pytest.mark.parametrize(
-    "scenario",
-    [pytest.param(s, id=f"{s.number}-{s.title}", marks=[pytest.mark.xfail(strict=True, reason=s.xfail, raises=s.raises)] if s.xfail else []) for s in SCENARIOS],
-)
+@pytest.mark.parametrize("scenario", [pytest.param(s, id=f"{s.number}-{s.title}") for s in SCENARIOS])
 async def test_scenario(ctx: Ctx, scenario: Scenario) -> None:
-    await asyncio.wait_for(scenario.run(ctx), 15 if scenario.xfail else 45)
+    await asyncio.wait_for(scenario.run(ctx), 45)
     await asyncio.sleep(0.2)  # let the PC finish its bookkeeping
     for task in ctx.phone._tasks[1:]:  # surface errors from the phone's receive tasks
         await asyncio.wait_for(task, 10)

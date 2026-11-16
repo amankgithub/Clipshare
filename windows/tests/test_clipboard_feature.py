@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ import pytest
 from clipbridge.features.clipboard import feature as cf
 from clipbridge.features.clipboard.feature import ClipboardFeature, save_png
 from clipbridge.link.envelope import MAX_PLAINTEXT
+from clipbridge.link.requests import Reply
 
 PNG = b"\x89PNG\r\n\x1a\nfake"
 
@@ -27,15 +29,15 @@ class FakePeer:
 class FakeLink:
     def __init__(self) -> None:
         self.peers: list[FakePeer] = []
-        self.sent: list[tuple[FakePeer, dict[str, Any], bytes]] = []
-        self.broadcasts: list[tuple[dict[str, Any], bytes, FakePeer | None]] = []
+        self.sent: list[tuple[FakePeer, dict[str, Any], bytes]] = []  # every request, in order
+        self.failing: set[str] = set()  # devices whose requests get no reply
+        self.raising: set[str] = set()  # devices whose requests raise
 
-    async def send(self, peer: FakePeer, header: dict[str, Any], body: bytes = b"") -> bool:
+    async def request(self, peer: FakePeer, header: dict[str, Any], body: bytes = b"") -> Reply | None:
         self.sent.append((peer, header, body))
-        return True
-
-    async def broadcast(self, header: dict[str, Any], body: bytes = b"", exclude: FakePeer | None = None) -> None:
-        self.broadcasts.append((header, body, exclude))
+        if peer.device in self.raising:
+            raise OSError("boom")
+        return None if peer.device in self.failing else Reply(True)
 
 
 class Env:
@@ -48,6 +50,9 @@ class Env:
             self.link, self.texts.append, self.images.append, save_dir=self.dir  # type: ignore[arg-type]
         )
 
+    async def drain(self) -> None:
+        await asyncio.gather(*self.feature._tasks)
+
 
 @pytest.fixture
 def env(tmp_path: Path) -> Env:
@@ -57,12 +62,13 @@ def env(tmp_path: Path) -> Env:
 # -- pending flush --------------------------------------------------------------
 async def test_pending_clip_flushed_once_to_first_supporting_peer(env: Env) -> None:
     await env.feature.on_local_text("copied offline")
-    assert env.link.broadcasts == [] and env.link.sent == []
+    assert env.link.sent == []
     legacy, phone, second = FakePeer(features={}), FakePeer("android-1"), FakePeer("android-2")
     await env.feature.on_peer_connected(legacy)  # no clipboard feature: pending stays
     assert env.link.sent == []
     await env.feature.on_peer_connected(phone)
     await env.feature.on_peer_connected(second)
+    await env.drain()
     ((peer, header, body),) = env.link.sent
     assert peer is phone and body == b""
     assert {k: header[k] for k in ("ch", "type", "kind", "data")} == {
@@ -74,6 +80,7 @@ async def test_pending_clip_flushed_once_to_first_supporting_peer(env: Env) -> N
 async def test_pending_image_flushed_with_png_body(env: Env) -> None:
     await env.feature.on_local_image(PNG)
     await env.feature.on_peer_connected(FakePeer())
+    await env.drain()
     ((_, header, body),) = env.link.sent
     assert header["kind"] == "image" and header["mime"] == "image/png" and body == PNG and "data" not in header
 
@@ -87,19 +94,74 @@ async def test_nothing_pending_sends_nothing_on_connect(env: Env) -> None:
 async def test_connected_peer_gets_broadcast_not_pending(env: Env) -> None:
     env.link.peers = [FakePeer()]
     await env.feature.on_local_text("now")
-    ((header, _, exclude),) = env.link.broadcasts
-    assert header["data"] == "now" and exclude is None
+    await env.drain()
+    ((_, header, _),) = env.link.sent
+    assert header["data"] == "now"
     await env.feature.on_peer_connected(FakePeer("android-2"))
-    assert env.link.sent == []
+    await env.drain()
+    assert len(env.link.sent) == 1  # nothing pending for the new peer
 
 
 async def test_local_text_cleaned_and_empty_ignored(env: Env) -> None:
     env.link.peers = [FakePeer()]
     await env.feature.on_local_text("")
     await env.feature.on_local_image(b"")
-    assert env.link.broadcasts == []
+    assert env.link.sent == []
     await env.feature.on_local_text("a\ud800b")  # lone surrogate must not reach the wire
-    assert env.link.broadcasts[0][0]["data"] == "a?b"
+    await env.drain()
+    assert env.link.sent[0][1]["data"] == "a?b"
+
+
+# -- undelivered clips stay pending per device ---------------------------------------------
+async def test_undelivered_clip_flushed_on_reconnect(env: Env) -> None:
+    phone = FakePeer()
+    env.link.peers, env.link.failing = [phone], {"android-1"}
+    await env.feature.on_local_text("lost")
+    await env.drain()
+    env.link.failing.clear()
+    await env.feature.on_peer_connected(FakePeer())  # same device, new connection
+    await env.drain()
+    assert [h["data"] for _, h, _ in env.link.sent] == ["lost", "lost"]
+    await env.feature.on_peer_connected(FakePeer())  # delivered: nothing left
+    await env.drain()
+    assert len(env.link.sent) == 2
+
+
+async def test_failure_after_reconnect_resends_to_new_connection(env: Env) -> None:
+    old, new = FakePeer(), FakePeer()
+    env.link.peers, env.link.failing = [old], {"android-1"}
+    await env.feature.on_local_text("late")
+    env.link.peers = [new]  # reconnected before the old request gave up
+    await env.drain()
+    assert [p for p, _, _ in env.link.sent] == [old, new]  # resent to the new connection at once
+    assert [h["data"] for _, h, _ in env.link.sent] == ["late", "late"]
+
+
+async def test_request_exception_parks_clip(env: Env) -> None:
+    env.link.peers, env.link.raising = [FakePeer()], {"android-1"}
+    await env.feature.on_local_text("x")
+    await env.drain()
+    assert list(env.feature._pending) == ["android-1"]
+
+
+async def test_newer_clip_replaces_pending(env: Env) -> None:
+    env.link.peers, env.link.failing = [FakePeer()], {"android-1"}
+    await env.feature.on_local_text("one")
+    await env.feature.on_local_text("two")
+    await env.drain()
+    env.link.failing.clear()
+    await env.feature.on_peer_connected(FakePeer())
+    await env.drain()
+    assert [h["data"] for _, h, _ in env.link.sent] == ["one", "two", "two"]
+
+
+async def test_delivered_clip_leaves_nothing_pending(env: Env) -> None:
+    env.link.peers = [FakePeer()]
+    await env.feature.on_local_text("ok")
+    await env.drain()
+    await env.feature.on_peer_connected(FakePeer())
+    await env.drain()
+    assert len(env.link.sent) == 1 and env.feature._pending == {}
 
 
 # -- oversize image ---------------------------------------------------------------
@@ -107,13 +169,14 @@ async def test_oversize_local_image_skipped_and_not_queued(env: Env) -> None:
     await env.feature.on_local_image(bytes(MAX_PLAINTEXT - 255))  # +256 header budget exceeds the limit
     env.link.peers = [FakePeer()]
     await env.feature.on_peer_connected(FakePeer())
-    assert env.link.broadcasts == [] and env.link.sent == []
+    assert env.link.sent == []
 
 
 async def test_largest_allowed_local_image_is_sent(env: Env) -> None:
     env.link.peers = [FakePeer()]
     await env.feature.on_local_image(bytes(MAX_PLAINTEXT - 256))
-    assert len(env.link.broadcasts) == 1
+    await env.drain()
+    assert len(env.link.sent) == 1
 
 
 # -- _parse / on_message -----------------------------------------------------------
@@ -152,7 +215,7 @@ def test_parse_accepts_text_and_png() -> None:
 )
 async def test_malformed_clip_changes_nothing(env: Env, header: dict[str, Any], body: bytes) -> None:
     await env.feature.on_message(FakePeer(), {"ch": "clipboard", **header}, body)  # type: ignore[arg-type]
-    assert env.texts == [] and env.images == [] and env.link.broadcasts == []
+    assert env.texts == [] and env.images == [] and env.link.sent == []
     assert not env.dir.exists()
 
 
@@ -172,15 +235,21 @@ async def test_remote_text_written_and_forwarded_to_others_only(env: Env) -> Non
     peer = FakePeer()
     await env.feature.on_message(peer, {"ch": "clipboard", "type": "clip", "kind": "text", "data": "hi"}, b"")  # type: ignore[arg-type]
     assert env.texts == ["hi"]
-    ((header, _, exclude),) = env.link.broadcasts
-    assert header["data"] == "hi" and exclude is peer
+    await env.drain()
+    assert env.link.sent == []  # the only peer is the sender
+    other = FakePeer("android-2")
+    env.link.peers = [peer, other]
+    await env.feature.on_message(peer, {"ch": "clipboard", "type": "clip", "kind": "text", "data": "yo"}, b"")  # type: ignore[arg-type]
+    await env.drain()
+    ((to, header, _),) = env.link.sent
+    assert header["data"] == "yo" and to is other
 
 
 async def test_remote_echo_dropped(env: Env) -> None:
     msg = {"ch": "clipboard", "type": "clip", "kind": "text", "data": "hi"}
     await env.feature.on_message(FakePeer(), msg, b"")  # type: ignore[arg-type]
     await env.feature.on_message(FakePeer("android-2"), msg, b"")  # type: ignore[arg-type]
-    assert env.texts == ["hi"] and len(env.link.broadcasts) == 1
+    assert env.texts == ["hi"]
 
 
 async def test_remote_image_saved_written_and_forwarded(env: Env) -> None:
@@ -188,7 +257,7 @@ async def test_remote_image_saved_written_and_forwarded(env: Env) -> None:
     await env.feature.on_message(peer, {"ch": "clipboard", "type": "clip", "kind": "image", "mime": "image/png"}, PNG)  # type: ignore[arg-type]
     (saved,) = env.dir.iterdir()
     assert saved.read_bytes() == PNG and saved.suffix == ".png" and saved.name.startswith("clip_")
-    assert env.images == [PNG] and env.link.broadcasts[0][1] == PNG and env.link.broadcasts[0][2] is peer
+    assert env.images == [PNG]
 
 
 async def test_remote_image_save_failure_still_writes_clipboard(env: Env, tmp_path: Path) -> None:

@@ -823,7 +823,7 @@ def s9(ctx: Ctx) -> Result:
 
 
 def s12(ctx: Ctx) -> Result:
-    """Same direction: PC->phone big + PC->phone small. Known bug until step 14 (PC sends FIFO per device)."""
+    """Same direction: PC->phone big + PC->phone small."""
     big = ctx.gen("big", ctx.big)
     small = ctx.gen("smallsame", 20 * 1024)
     mark = ctx.log.mark()
@@ -1183,7 +1183,7 @@ SCENARIOS: list[tuple[str, str, Callable[[Ctx], Result]]] = [
     ("20", "unknown device rejected", s20),
 ]
 PAIRING = {"18", "19", "20"}  # change the phone's pairing; only run with --pairing, always restored
-XFAIL = {"12": "step 14", "16": "bug: clip sent into dead peer is lost"}  # known product bugs: must fail with the symptom; passing unexpectedly is XPASS
+XFAIL: dict[str, str] = {}  # known product bugs: must fail with the symptom; passing unexpectedly is XPASS
 DEPS = {"11": ["8"]}  # scenarios that need another one's data
 
 

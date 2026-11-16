@@ -5,7 +5,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
@@ -44,7 +43,7 @@ class SecureSocket(
 
     val isReady: Boolean get() = phase == Phase.READY && !closed.isCompleted
 
-    fun open(http: OkHttpClient): SecureSocket {
+    fun open(http: WebSocket.Factory): SecureSocket {
         val req = Request.Builder().url("ws://${endpoint.host}:${endpoint.port}/")
             .header("Sec-WebSocket-Protocol", subprotocol).build()
         ws = http.newWebSocket(req, this)

@@ -1,12 +1,13 @@
 package com.clipbridge
 
 import android.content.Context
+import android.content.SharedPreferences
 import com.clipbridge.link.Endpoint
 import com.clipbridge.link.Pairing
 
 /** App-private prefs: pairing (device id + PSK), manual host, last good endpoint. Never logged. */
-class Settings(context: Context) {
-    private val p = context.getSharedPreferences("clipbridge", Context.MODE_PRIVATE)
+class Settings(private val p: SharedPreferences) {
+    constructor(context: Context) : this(context.getSharedPreferences("clipbridge", Context.MODE_PRIVATE))
 
     /** Device id and PSK assigned by the PC, stored as one pairing code; null until paired. */
     var pairing: Pairing?

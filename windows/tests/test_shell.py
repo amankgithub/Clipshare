@@ -1,10 +1,13 @@
 """CLI entry points: send path validation, pipe request codec, pipe round trip, unpair, install data."""
 
 import json
+import os
 import threading
+import uuid
 from pathlib import Path
 
 import pytest
+import pywintypes
 
 from clipbridge import install
 from clipbridge.__main__ import main
@@ -154,7 +157,6 @@ def test_devices_cli_lists_paired(
 def test_unpair_cli_reports_pipe_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    import pywintypes
 
     def denied(request: pipe.Request) -> None:
         raise pywintypes.error(5, "CreateFile", "Access is denied.")
@@ -165,3 +167,149 @@ def test_unpair_cli_reports_pipe_failure(
     assert main(["unpair", "android-1"]) == 1
     assert "key removed, live connections not dropped" in capsys.readouterr().out
     assert config.DeviceRegistry().load() == {}
+
+
+# -- send(): other pipe errors -----------------------------------------------
+@pytest.mark.xfail(
+    strict=True,
+    raises=pywintypes.error,
+    reason="bug: send() only catches ServerNotRunning; a pywintypes.error (e.g. access denied) escapes as a traceback",
+)
+def test_send_cli_pipe_error_is_a_clean_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+
+    def denied(request: pipe.Request) -> None:
+        raise pywintypes.error(5, "CreateFile", "Access is denied.")
+
+    monkeypatch.setattr(pipe, "send_request", denied)
+    (tmp_path / "f.txt").write_text("f")
+    assert main(["send", str(tmp_path / "f.txt")]) != 0
+    assert "Access is denied" in capsys.readouterr().out
+
+
+# -- pipe client busy loop ---------------------------------------------------
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        self.now += 0.5
+        return self.now
+
+
+@pytest.fixture
+def fake_pipe(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace the win32 calls the client makes; returns the event log."""
+    log: list[str] = []
+    monkeypatch.setattr(pipe, "time", _Clock())
+    monkeypatch.setattr(pipe.win32pipe, "WaitNamedPipe", lambda name, ms: log.append("wait"))
+    monkeypatch.setattr(pipe.win32pipe, "SetNamedPipeHandleState", lambda *a: log.append("mode"))
+    monkeypatch.setattr(pipe.win32file, "WriteFile", lambda h, data: log.append("write"))
+    monkeypatch.setattr(pipe.win32file, "ReadFile", lambda h, n: log.append("read") or (0, b"\x01"))
+    monkeypatch.setattr(pipe.win32file, "CloseHandle", lambda h: log.append("close"))
+    return log
+
+
+def test_client_retries_while_pipe_busy_then_sends(fake_pipe: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    import winerror
+
+    attempts = iter([winerror.ERROR_PIPE_BUSY, winerror.ERROR_PIPE_BUSY, None])
+
+    def create(*args: object) -> object:
+        code = next(attempts)
+        if code is not None:
+            raise pywintypes.error(code, "CreateFile", "busy")
+        return object()
+
+    monkeypatch.setattr(pipe.win32file, "CreateFile", create)
+    pipe.send_request(pipe.Unpair("android-1"))
+    assert fake_pipe == ["wait", "wait", "mode", "write", "read", "close"]
+
+
+def test_client_gives_up_after_deadline_with_busy_error(fake_pipe: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    import winerror
+
+    calls = 0
+
+    def busy(*args: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise pywintypes.error(winerror.ERROR_PIPE_BUSY, "CreateFile", "busy")
+
+    monkeypatch.setattr(pipe.win32file, "CreateFile", busy)
+    with pytest.raises(pywintypes.error) as info:
+        pipe.send_request(pipe.Unpair("android-1"))
+    assert info.value.winerror == winerror.ERROR_PIPE_BUSY
+    assert 1 < calls <= 20  # bounded by CONNECT_TIMEOUT_MS, not an endless loop
+    assert "write" not in fake_pipe
+
+
+def test_client_other_error_is_raised_immediately(fake_pipe: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+
+    def denied(*args: object) -> object:
+        raise pywintypes.error(5, "CreateFile", "Access is denied.")
+
+    monkeypatch.setattr(pipe.win32file, "CreateFile", denied)
+    with pytest.raises(pywintypes.error):
+        pipe.send_request(pipe.Unpair("android-1"))
+    assert fake_pipe == []
+
+
+def test_client_closes_handle_when_write_fails(fake_pipe: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+
+    monkeypatch.setattr(pipe.win32file, "CreateFile", lambda *a: object())
+
+    def broken(h: object, data: bytes) -> None:
+        raise pywintypes.error(109, "WriteFile", "broken pipe")
+
+    monkeypatch.setattr(pipe.win32file, "WriteFile", broken)
+    with pytest.raises(pywintypes.error):
+        pipe.send_request(pipe.Unpair("android-1"))
+    assert fake_pipe[-1] == "close"
+
+
+# -- server: malformed request ---------------------------------------------------
+def _raw_exchange(name: str, payload: bytes, outcome: list[object]) -> None:
+    import win32con
+    import win32file
+    import win32pipe
+
+    handle = win32file.CreateFile(
+        name, win32con.GENERIC_READ | win32con.GENERIC_WRITE, 0, None, win32con.OPEN_EXISTING, 0, None
+    )
+    try:
+        win32pipe.SetNamedPipeHandleState(handle, win32pipe.PIPE_READMODE_MESSAGE, None, None)
+        win32file.WriteFile(handle, payload)
+        try:
+            outcome.append(win32file.ReadFile(handle, 1)[1])
+        except pywintypes.error as e:
+            outcome.append(e.winerror)
+    finally:
+        win32file.CloseHandle(handle)
+
+
+@pytest.mark.parametrize("payload", [b"not json", b"\xff\xfe", b'{"send": 3}', b"[]"])
+def test_malformed_pipe_request_gets_reply_or_clean_close_and_server_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: bytes
+) -> None:
+    import winerror
+
+    name = rf"\\.\pipe\ClipBridgeTest-malformed-{os.getpid()}-{uuid.uuid4().hex}"
+    monkeypatch.setattr(pipe, "PIPE_NAME", name)
+    received: list[pipe.Request] = []
+    server = pipe.PipeServer(received.append)
+    server.start()
+    try:
+        outcome: list[object] = []
+        client = threading.Thread(target=_raw_exchange, args=(name, payload, outcome), daemon=True)
+        client.start()
+        client.join(5)
+        assert not client.is_alive(), "client hangs on a malformed request"  # xfail-worthy if it does
+        assert outcome and outcome == [winerror.ERROR_PIPE_NOT_CONNECTED]  # no ack: the server logs and disconnects, so the read fails
+        assert received == []  # never handed to the server logic
+        pipe.send_request(pipe.Unpair("android-1"))  # still serving
+        assert received == [pipe.Unpair("android-1")]
+    finally:
+        server.stop()
+        server.join(5)

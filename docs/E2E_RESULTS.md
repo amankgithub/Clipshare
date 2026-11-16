@@ -35,3 +35,34 @@ Not tested yet (needs hands on the phone): pasting the received image into an ap
 
 Note: .NET `Clipboard.SetImage` threw "Requested Clipboard operation did not succeed" while the data was still delivered; likely the daemon opening the clipboard during the setter's flush. Watch for this with real apps.
 Gotcha: the tool shell's `%LOCALAPPDATA%` is virtualized too, so the real daemon log cannot be read from it.
+
+## Automated device run (step 13, 2026-11-16)
+`windows/e2e/device.py` (full sizes) and `--pairing`, from a normal terminal, vivo V2502 on USB, same 5 GHz Wi-Fi,
+debug APK built from the step 13 commit.
+
+| # | Scenario | Result | Notes |
+|---|---|---|---|
+| 1 | PC→phone 10 KB | PASS | |
+| 2 | PC→phone 1 GB | PASS | 18.6 MB/s |
+| 3 | Phone→PC photo 4 MB | PASS | |
+| 4 | Phone→PC 5 photos + PDF, one share | PASS | 20 MB, 5.0 MB/s |
+| 5 | PC→phone mixed small + 200 MB | PASS | |
+| 6 | Empty file both ways | PASS | |
+| 7 | Name clash ` (1)`, both ways, different content | PASS | |
+| 8 | Clips during a 1 GB transfer | PASS | 15 ms PC→phone, 32 ms phone→PC, transfer moving at each clip |
+| 9 | Small file during a big one, opposite directions | FAIL once, then PASS twice | first run: the 1 GB PC→phone transfer did not start within 30 s; `--only 9` and `--only 8,9` passed (2 GB, ~14 MB/s); not reproduced |
+| 10 | Wi-Fi off/on mid-transfer | PASS | had 20 % at drop, resumed at 20 % |
+| 11 | No clip ping-pong | PASS | phone and PC logs clean |
+| 12 | Small during big, same direction | XFAIL (step 14) | small started 0.1 s after the big one finished, 46 s after it was sent |
+| 13 | PC server restart | PASS | link back 2.5 s after task start |
+| 14 | App force-stop / `am kill` | PASS | link 1.8 s after relaunch; survives `am kill` |
+| 15 | Idle Wi-Fi off/on | PASS | reconnect 10.0 s |
+| 16 | PC clip right after the phone vanished | XFAIL (step 14) | PC log shows the clip sent to the still-held dead peer; never arrived |
+| 16b | Offline clip flush | PASS | PC dropped the peer 19 s after Wi-Fi off; only the latest clip arrived |
+| 17 | Connected state + hello | PASS | |
+| 18 | Dead manual host | PASS | dead dial seen; link 5.0 s after Wi-Fi on |
+| 19 | Wrong PSK | PASS | PC log shows the rejection |
+| 20 | Unknown device | PASS | PC log shows the rejection |
+
+Observed: while rejected (19, 20) the phone was dialling the PC's link-local address `169.254.171.177`, which the PC
+advertises alongside its LAN address (on purpose, for router-less links); see "Known bugs" in `docs/PLAN.md`.

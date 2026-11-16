@@ -1,6 +1,7 @@
 package com.clipbridge.features.clipboard
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -21,43 +22,15 @@ class ShareTargetActivity : Activity() {
         when (i?.action) {
             Intent.ACTION_SEND -> {
                 val uri = uriExtra(i)
-                if (uri != null) sendUris(listOf(uri))
+                if (uri != null) sendUris(this, listOf(uri), i.type)
                 else i.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()
                     ?.takeIf { it.isNotEmpty() }?.let { BridgeService.submit(this, it) }
             }
-            Intent.ACTION_SEND_MULTIPLE -> sendUris(uriList(i))
+            Intent.ACTION_SEND_MULTIPLE -> sendUris(this, uriList(i), i.type)
         }
         finish()
         overridePendingTransition(0, 0)
     }
-
-    /**
-     * Toasts "Sending…" now; the result comes later ([ImageDelivery] per image, the files feature per file).
-     * Files are opened here, while this activity holds the share grant.
-     */
-    private fun sendUris(uris: List<Uri>) {
-        var images = 0
-        val files = ArrayList<ContentSource>()
-        val single = uris.size == 1
-        for (uri in uris) {
-            val file = ContentSource.open(this, uri)
-            val png = if (single && isImage(uri) && (file == null || file.size <= ImageUtil.MAX_BYTES)) {
-                ImageUtil.readPng(this, uri)?.takeIf { it.isNotEmpty() && it.size <= ImageUtil.MAX_BYTES }
-            } else null
-            if (png != null) { file?.close(); BridgeService.submitImage(this, png); images++ }
-            else if (file != null) files += file
-        }
-        BridgeService.submitFiles(this, files)
-        val msg = when {
-            images + files.size == 0 -> "Couldn't read " + if (uris.size == 1) "file" else "files"
-            files.isEmpty() -> if (images == 1) "Sending image to PC…" else "Sending $images images to PC…"
-            images == 0 && files.size == 1 -> "Sending ${files[0].name} to PC…"
-            else -> "Sending ${images + files.size} files to PC…"
-        }
-        Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
-    }
-
-    private fun isImage(uri: Uri): Boolean = (contentResolver.getType(uri) ?: intent.type)?.startsWith("image/") == true
 
     @Suppress("DEPRECATION")
     private fun uriExtra(i: Intent): Uri? =
@@ -68,4 +41,31 @@ class ShareTargetActivity : Activity() {
     private fun uriList(i: Intent): List<Uri> =
         (if (Build.VERSION.SDK_INT >= 33) i.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
         else i.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)) ?: emptyList()
+}
+
+/**
+ * Toasts "Sending…" now; the result comes later ([ImageDelivery] per image, the files feature per file).
+ * Files are opened here, while the caller holds the share grant.
+ */
+internal fun sendUris(context: Context, uris: List<Uri>, intentType: String?) {
+    var images = 0
+    val files = ArrayList<ContentSource>()
+    val single = uris.size == 1
+    for (uri in uris) {
+        val file = ContentSource.open(context, uri)
+        val image = (context.contentResolver.getType(uri) ?: intentType)?.startsWith("image/") == true
+        val png = if (single && image && (file == null || file.size <= ImageUtil.MAX_BYTES)) {
+            ImageUtil.readPng(context, uri)?.takeIf { it.isNotEmpty() && it.size <= ImageUtil.MAX_BYTES }
+        } else null
+        if (png != null) { file?.close(); BridgeService.submitImage(context, png); images++ }
+        else if (file != null) files += file
+    }
+    BridgeService.submitFiles(context, files)
+    val msg = when {
+        images + files.size == 0 -> "Couldn't read " + if (uris.size == 1) "file" else "files"
+        files.isEmpty() -> if (images == 1) "Sending image to PC…" else "Sending $images images to PC…"
+        images == 0 && files.size == 1 -> "Sending ${files[0].name} to PC…"
+        else -> "Sending ${images + files.size} files to PC…"
+    }
+    Toast.makeText(context.applicationContext, msg, Toast.LENGTH_SHORT).show()
 }

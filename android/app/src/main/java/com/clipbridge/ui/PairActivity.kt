@@ -5,7 +5,6 @@ import android.os.Bundle
 import android.util.Log
 import com.clipbridge.BridgeService
 import com.clipbridge.Settings
-import com.clipbridge.link.Pairing
 
 /**
  * Exported but guarded by android.permission.DUMP in the manifest, so only `adb shell` can call it
@@ -19,13 +18,9 @@ class PairActivity : Activity() {
         val device = intent.getStringExtra("device")
         val psk = intent.getStringExtra("psk")
         val host = intent.getStringExtra("host")
-        var changed = false
-        if (device != null || psk != null) {
-            val pairing = if (device != null && psk != null) Pairing.of(device, psk.trim()) else null
-            if (pairing != null) { s.pairing = pairing; changed = true } else Log.w("ClipBridge", "pair: invalid device/psk")
-        }
-        if (host != null) { s.manualHost = host; changed = true }
-        if (changed) BridgeService.reconfigure(this)
+        val r = PairExtras.apply(s, device, psk, host)
+        if (r.invalidPairing) Log.w("ClipBridge", "pair: invalid device/psk")
+        if (r.changed) BridgeService.reconfigure(this)
         finish()
     }
 }

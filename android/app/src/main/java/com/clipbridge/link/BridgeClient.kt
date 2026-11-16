@@ -9,6 +9,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
+import okhttp3.WebSocket
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
@@ -31,6 +32,9 @@ class BridgeClient(
     partials: PartialStore,
     onTransferBusy: (Boolean) -> Unit,
     private val log: (String) -> Unit = {},
+    /** Where control sockets come from; [http] unless a test supplies a fake. */
+    private val sockets: WebSocket.Factory? = null,
+    private val newBackoff: () -> Backoff = { Backoff() },
 ) : LinkSender {
 
     private val http = OkHttpClient.Builder()
@@ -94,7 +98,7 @@ class BridgeClient(
     }
 
     private suspend fun loop() {
-        val backoff = Backoff()
+        val backoff = newBackoff()
         while (scope.isActive) {
             val pairing = pairingProvider()
             val eps = endpointsProvider()
@@ -123,7 +127,7 @@ class BridgeClient(
         )
         session = s
         try {
-            s.open(http)
+            s.open(sockets ?: http)
         } catch (e: IllegalArgumentException) {
             log("bad endpoint"); session = null
             return false

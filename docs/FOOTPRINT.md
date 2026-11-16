@@ -14,7 +14,7 @@ listed here (see `CLAUDE.md`).
 | SendTo shortcut "Phone (ClipBridge)" | `shell:sendto` (`%APPDATA%\Microsoft\Windows\SendTo`) | `clipbridge uninstall` |
 | Device registry (paired devices and their DPAPI-encrypted keys) | `%APPDATA%\ClipBridge` | `clipbridge uninstall --purge` |
 | Logs + unfinished transfers | `%LOCALAPPDATA%\ClipBridge` | `clipbridge uninstall --purge` |
-| Android build cache (only if you build the APK) | `%USERPROFILE%\.gradle` (shared with other Android projects) | delete manually if nothing else uses it |
+| Android build cache (only if you build the APK), including the test-only library `kotlinx-coroutines-test` (unit tests only, never in the APK) | `%USERPROFILE%\.gradle` (shared with other Android projects) | delete manually if nothing else uses it; drop the library by removing its `testImplementation` line in `android/app/build.gradle.kts` together with the tests that use it |
 | **Your data**: received files, received clipboard images | `Downloads\ClipShare`, `Pictures\ClipBridge` | never deleted automatically |
 
 Not installed by ClipBridge (pre-existing tools it uses): Python 3.10, Android Studio + SDK, adb.
@@ -34,4 +34,5 @@ Then delete the repo folder. Keep or delete `Downloads\ClipShare` and `Pictures\
 |---|---|
 | App `com.clipbridge`, its settings, key and unfinished transfers | uninstalling the app |
 | adb grants from setup (`READ_LOGS`, overlay app-op, battery-optimization whitelist) | uninstalling the app |
+| Debug builds only: the device-test share hook `E2eShareActivity` and its staging folder `Android/data/com.clipbridge/files/e2e` (emptied by `windows/e2e/device.py` after every run) | uninstalling the app; release builds never contain it |
 | **Your data**: received files in `Downloads/ClipShare` | never deleted automatically |

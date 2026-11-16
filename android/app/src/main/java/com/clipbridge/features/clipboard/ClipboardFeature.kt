@@ -10,7 +10,7 @@ import org.json.JSONObject
 /** Clipboard feature (`ch = "clipboard"`): text and PNG image clips, both directions. */
 class ClipboardFeature(
     private val sender: LinkSender,
-    private val writer: ClipboardWriter,
+    private val writer: ClipSink,
     private val engine: SyncEngine = SyncEngine(),
 ) : Feature {
     override val name = "clipboard"

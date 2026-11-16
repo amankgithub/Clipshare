@@ -116,7 +116,7 @@ app/src/main/java/com/clipbridge/
   net/BridgeClient.kt         connect loop: each attempt tries endpoints in order mDNS > cached > manual, every dial
                               bounded (~3 s) so a dead address never blocks the next; a failed cached or manual host
                               triggers a fresh mDNS browse and is never retried alone; the manual host is a last-resort
-                              fallback for networks that block mDNS, and the UI shows when it fails; backoff 1→30s + jitter,
+                              fallback for networks that block mDNS, and the UI shows when it fails; backoff 1→10s + jitter,
                               reset on success; NetworkCallback.onAvailable → immediate retry; exposes StateFlow<Status>
   clipboard/ClipboardWriter.kt     setPrimaryClip (background writes are allowed)
   clipboard/LogcatTrigger.kt       registers OnPrimaryClipChangedListener; runs `logcat -T 1 ClipboardService:E *:S`,
@@ -209,59 +209,107 @@ On the extender, Wi-Fi stalls of 10–20 s drop the link; the transfer reconnect
   only if listed. Done = own test files pass. No docs, no commit. Report in 5 lines max."
 - Planned split for the next steps (fixed exactly by each step's orchestrator after the previous step lands):
   - 12: spec worker (per-device keys, `hello`, request/response, vectors), then Windows + Android workers.
-  - 13: no spec worker (no wire change). Parallel workers: loopback suite (`windows/tests/test_scenarios.py`,
-    may extend `tests/tclient.py`); device runner (`windows/e2e/`). An Android worker only if `am start` cannot
-    deliver several URIs to `ShareTargetActivity` (then a debug-build-only hook, nothing in release).
-    Orchestrator runs the device run once on the vivo and fixes any real bugs it finds as a follow-up piece.
+  - 13: no spec worker (no wire change). A coverage audit first, then parallel workers on disjoint files: loopback
+    scenarios, Python link/discovery gaps, Python pairing/CLI/install/clipboard gaps, device runner, Android debug
+    share hook; the Kotlin unit worker and then the interop worker run one after the other (one Gradle build).
+    Bugs found are pinned as expected failures and fixed in the step that owns them ("Known bugs").
   - 14: spec worker (streams; file transfer and large clip bodies move onto them), then Windows + Android workers.
   - 15: phase 1 Windows + Android `platform/` workers (extract clipboard, notifications/tray, settings, storage,
     power, command bus; per-feature serial queues; log-redaction helper); phase 2 Windows + Android `entry/`
     workers (feature public APIs, CLI/Explorer/tray menu, QS tiles, share router; `app.py` / `BridgeService.kt`
-    composition roots). No behaviour change.
+    composition roots). No behaviour change except the pairing, CLI, install and malformed-clip bugs in "Known bugs".
 - Device checks on the vivo: after step 13, every step's orchestrator runs `python windows/e2e/device.py` with the
   phone attached and reports its pass/fail table; before step 13 they were done by hand.
 
-## Scenario tests (step 13)
-One scenario list, two runners. Each scenario names its files, direction, and what "pass" means.
+## Tests (step 13)
+Four layers, each catching what the one below cannot. Every known bug is pinned by a strict expected-failure
+test (Python `xfail(strict=True, raises=...)`, Kotlin `expectBug`, device `XFAIL`): it fails the run the moment
+the bug is fixed without updating the test, and the step that owns the fix flips it to a normal test.
 
-Scenarios (sizes are defaults; `--quick` shrinks the big ones for a fast run):
+**1. Unit tests** (`pytest windows/tests`, `gradlew :app:testDebugUnitTest`), no network beyond 127.0.0.1, no
+real registry, Task Scheduler, firewall, adb, clipboard or user folders (all faked or in temp dirs):
+- Python link: every `auth` field check, replayed `auth` on a new connection, wrong or missing subprotocol, garbled
+  first frame, hello rules, request/reply incl. send failure and timeout, liveness ping timeout, stall drop,
+  feature connect/disconnect callbacks incl. a replaced (4409) peer, mDNS advertise / IP change / no address.
+- Python pairing, CLI and install: `pair` with a fake adb, device registry (corrupt file, lock timeout, re-key),
+  named pipe (malformed request, busy loop), `send`, `install` / `uninstall [--purge]` / `status`, task XML.
+- Python clipboard feature: pending flush on connect, malformed clips, oversize images, DIB↔PNG, Win32 formats.
+- Kotlin: `SecureSocket` handshake state machine against a fake socket; `BridgeClient` connect loop on virtual
+  time (endpoint order, a dead manual host falls through to mDNS and cached in the same pass, status flow, backoff
+  1→10 s and its reset, retry / reconnect / network lost); clipboard feature; pairing extras (`ui/PairExtras.kt`)
+  and settings. Seams: `BridgeClient(sockets, newBackoff)`, `SecureSocket.open(WebSocket.Factory)`, `ClipSink`,
+  `Settings(SharedPreferences)`; defaults are the production objects.
+
+**2. Kotlin↔Python interop** (`android/app/src/test/.../interop/`, part of the Android unit tests): the real
+Kotlin link (OkHttp, `SecureSocket`, `BridgeClient`, `ClipboardFeature`) against the real Python server started
+by `windows/tests/interop_server.py` (key via stdin only). Covers hello and `supports`, clips both ways with
+receipts, wrong PSK and unknown device (4401, then backoff), kick and server restart (reconnect ~1 s), a refused
+or black-holed manual host falling through to mDNS (≤ the 4 s connect timeout).
+
+**3. Loopback scenarios** (`windows/tests/test_scenarios.py`, part of `pytest windows/tests`, < 30 s): real
+server on 127.0.0.1, `tests/tclient.py` as the phone, temp dirs both sides, big = 64 MB. Runs file scenarios
+1–2 and 4–10 below; 10 by dropping the data connection mid-range and counting the bytes sent after it.
+
+**4. Device run** (`windows/e2e/device.py`, by hand or by a step's orchestrator; not part of pytest): the real
+`ClipBridge` task and the real app on the vivo over adb (USB), same Wi-Fi. Run from a normal terminal (the tool
+shell cannot read the PC log). It does what a person does:
+- PC→phone files: `clipbridge send` (same path as Explorer "Send to phone"); poll `/sdcard/Download/ClipShare`,
+  compare `adb shell sha256sum`.
+- Phone→PC files: `adb shell am start` cannot carry a multi-file share and the app cannot read shell-pushed
+  MediaStore files, so debug builds carry `E2eShareActivity`: files are pushed to the app's own
+  `Android/data/com.clipbridge/files/e2e` and sent as one share through the share target's own send path.
+- Clips: set the Windows clipboard / share text to `ShareTargetActivity`; confirm by length and hash in the logs.
+- Link state from the app's foreground notification; Wi-Fi via `svc wifi`; PC restart via the scheduled task.
+- Checks preconditions first (adb, unlocked, hook present, service, task, link), cleans up every test file on
+  both sides even on failure, prints one line per scenario (pass / fail / XFAIL, size, time, MB/s), exits
+  non-zero on any failure, unexpected pass or skip (`--allow-skip` to permit skips). Test photos and PDF are
+  generated; nothing is installed. `--quick` shrinks big files; `--only N` runs N and its prerequisites.
+
+Device scenarios:
 1. PC→phone one small file (10 KB).
-2. PC→phone one big file (1 GB, random bytes).
-3. Phone→PC one photo (real JPEG, ~4 MB).
+2. PC→phone one big file (1 GB).
+3. Phone→PC one photo.
 4. Phone→PC five photos + a PDF in one share.
 5. PC→phone several files at once (mixed small + 200 MB).
 6. Empty file, both directions.
-7. Name clash: same name sent twice → second gets the ` (1)` suffix, both intact.
-8. Small clip during a big transfer: start (2) or (4), then copy text on the PC and share text from the phone
-   mid-transfer → each clip arrives in <1 s while the transfer is running; the transfer still completes intact.
-9. Small file during a big transfer, both directions → the small file is not stuck behind the big one.
-10. Phone Wi-Fi off/on mid-transfer → resumes from `have` (bytes sent after reconnect < file size), not restart.
-11. Clip ping-pong: after scenario 8, no clip bounces back (logs show the drop).
+7. Name clash → second gets the ` (1)` suffix, both intact.
+8. Clips both ways during a big transfer arrive in < 1 s; the transfer is proven moving at each clip and completes.
+9. Small file during a big transfer in the other direction is not stuck; the big one is proven in flight around it.
+10. Phone Wi-Fi off/on mid-transfer resumes from `have` (bytes re-sent < file size).
+11. No clip ping-pong after 8.
+12. Small file during a big transfer in the same direction (known bug, XFAIL).
+13. PC server restart → link back < 15 s, clip passes.
+14. App force-stopped and relaunched → link back, clip passes; `am kill` in the background leaves it connected.
+15. Idle Wi-Fi off/on → reconnect < 15 s, clip passes.
+16. PC clip set right after the phone drops off (known bug, XFAIL).
+16b. Offline clips after the PC has dropped the phone: only the latest arrives after reconnect.
+17. Connected state and hello visible on both sides after reconnect.
+
+With `--pairing` only (changes the phone's pairing, always restored; on a failed restore it prints the
+`clipbridge pair` command to run):
+18. Dead manual host (proven set) → link through mDNS within the dead dial's timeout.
+19. Wrong PSK → rejected (PC log shows the auth failure), no link, no clip.
+20. Unknown device → likewise.
 
 Pass = every received file's SHA-256 equals the source, it sits in the expected folder with the expected name,
-no partial/pending file is left behind, and the timing limits above hold.
+no partial/pending file is left, and the timing limits hold.
 
-**Loopback runner** (`windows/tests/test_scenarios.py`, part of `pytest windows/tests`): real server on
-127.0.0.1, `tests/tclient.py` as the phone, temp dirs for both sides; big sizes scaled down (e.g. 64 MB) so the
-suite stays under ~30 s. Covers 1–2, 4–9; 10 by closing the client's data connection mid-range. Catches protocol
-and concurrency bugs on every change without a phone.
-
-**Device runner** (`windows/e2e/device.py`, run by hand or by the orchestrator; not part of pytest): real PC
-server (the installed `ClipBridge` task), real app on the vivo over adb (USB or wireless debugging), same Wi-Fi.
-It does what a person does:
-- PC→phone: `clipbridge send <files>` (same path as Explorer "Send to phone"); poll
-  `adb shell ls /sdcard/Download/ClipShare` until the files appear, then compare `adb shell sha256sum`.
-- Phone→PC: `adb push` test files to a temp dir on the phone, media-scan them, then
-  `adb shell am start -a android.intent.action.SEND[_MULTIPLE]` to `ShareTargetActivity` with their content URIs
-  (what the share sheet sends); poll `Downloads\ClipShare` on the PC and hash.
-- PC clip: set the Windows clipboard from the script; confirm on the phone from logcat (length/hash lines only).
-- Phone clip: share text to `ShareTargetActivity`; read the Windows clipboard and compare.
-- Wi-Fi toggle: `adb shell svc wifi disable/enable` mid-transfer (over USB, so adb survives).
-Preconditions it checks first and reports clearly: adb device present, screen unlocked, app's service running,
-PC task running, both on the link. Cleans up every test file it created on both sides, even on failure. Prints one
-line per scenario (pass/fail, size, time, MB/s) and exits non-zero on any failure. Test photos and PDF are
-generated by the script (no binary fixtures in the repo). Nothing is installed; adb is already listed in
-`docs/FOOTPRINT.md`.
+### Known bugs (pinned by expected-failure tests)
+| Bug | Pinned by | Fixed in step |
+|---|---|---|
+| PC sends one file at a time per device: a small file waits behind a big one in the same direction | loopback 9, device 12 | 14 |
+| A clip sent to a peer that silently dropped is lost (the PC keeps the peer for up to ping interval + timeout; failed deliveries are not re-queued) | device 16 | 14 |
+| A malformed clip is answered `ok:true` (both sides) | `test_clipboard_feature.py`, `ClipboardFeatureTest` | 15 |
+| Phone waits forever for the server hello after the handshake (status stays connecting) | `BridgeClientLoopTest`, `InteropTest` | 17 |
+| Backoff resets on handshake success, so a connect-then-drop server is redialled every ~1 s | `BridgeClientLoopTest`, `InteropTest` | 17 |
+| mDNS advertiser never recovers if Zeroconf fails at start | `test_discovery.py` | 17 |
+| Phone ignores a lost mDNS service and never retries a failed discovery start (device-only, no test yet) | — | 17 |
+| Phone may dial the PC's advertised link-local `169.254.x` address before its LAN address (seen in the device run; no test yet) | — | 17 |
+| `clipbridge pair` saves the key before the adb push: a failed push leaves a live key | `test_pair.py` | 15 |
+| Re-pairing mints a new device id; the old id and key stay valid | `test_pair.py` | 15 |
+| `_find_adb` returns a cwd-relative path when `LOCALAPPDATA` is unset | `test_pair.py` | 15 |
+| `install` leaves the task, verb and shortcut behind when UAC is declined | `test_install.py` | 15 |
+| `clipbridge send` shows a traceback on a pipe error other than "server not running" | `test_shell.py` | 15 |
 
 ## Build order
 0. **Spike (de-risk, throwaway, on the vivo)**: minimal APK with FGS + listener + logcat reader + transparent activity. Confirm on Android 16: (a) denial line format, (b) logcat consent dialog behavior from a FGS and after reboot, (c) background activity start + clipboard read works. Outcome decides: auto-sync as designed / auto-sync needing "re-enable after reboot" notification tap / manual-only (tile+share). Report result before continuing.
@@ -277,13 +325,14 @@ generated by the script (no binary fixtures in the repo). Nothing is installed; 
 10. File transfer end to end on the vivo + speed benchmark (`STREAMS` 1 vs 3 against a raw-socket ceiling).
 11. Review fixes from `docs/REVIEW.md`: PSK and device id out of backups, network exposure and pre-auth limits, manual-host crash, clipboard privacy formats (the top 5 minus per-device keys, which come with step 12), then B2/B3 (lost `xfer_done`, disk errors and missing timeouts).
 12. Link: `hello` + device registry + per-device keys (`PROTOCOL.md` §2/§3), then request/response.
-13. Automated scenario tests, two layers running one shared scenario list (see "Scenario tests" below): a loopback
-    pytest suite (`windows/tests/test_scenarios.py`, no phone) and a device run on the vivo
-    (`windows/e2e/device.py`) that drives the same paths a person uses by hand. Replaces the manual device checks.
-14. Link: streams; file transfer moves onto them; large clip bodies leave the control connection.
-15. Platform and entry layers (Target layering): extract clipboard access, notifications/tray, settings, storage, power and the command bus; share router in `entry/`; per-feature serial queues; `CLAUDE.md` layout and layering rule updated. No behaviour change; tests stay green.
+13. Automated tests in four layers (see "Tests" above): unit tests both sides, Kotlin↔Python interop, loopback
+    scenarios, and a device run on the vivo (`windows/e2e/device.py`) that drives the same paths a person uses by
+    hand. Replaces the manual device checks; bugs found are pinned as expected failures ("Known bugs").
+14. Link: streams; file transfer moves onto them; large clip bodies leave the control connection. Fixes the
+    one-file-at-a-time and lost-clip-to-dropped-peer bugs ("Known bugs").
+15. Platform and entry layers (Target layering): extract clipboard access, notifications/tray, settings, storage, power and the command bus; share router in `entry/`; per-feature serial queues; `CLAUDE.md` layout and layering rule updated. No behaviour change except the step-15 rows of "Known bugs"; tests stay green.
 16. Privileged helper (Android, started over adb) as a platform service; first user: phone→PC clipboard without a tap.
-17. Endpoint selection and bearers. First the endpoint order in `BridgeClient` (mDNS > cached > manual, bounded dials, re-browse on failure; see Android side), replacing manual > mDNS > cached. Then the bearers: laptop Mobile Hotspot + `WifiNetworkSuggestion`, USB via `adb reverse`; the link uses the first that answers. Independent of 16.
+17. Endpoint selection and bearers. First the endpoint order in `BridgeClient` (mDNS > cached > manual, bounded dials, re-browse on failure; see Android side), replacing manual > mDNS > cached, with the step-17 rows of "Known bugs" (hello timeout, backoff reset, discovery recovery on both sides). Then the bearers: laptop Mobile Hotspot + `WifiNetworkSuggestion`, USB via `adb reverse`; the link uses the first that answers. Independent of 16.
 18. Phone mirroring on the PC (media stream + input injection through the helper).
 19. Input sharing PC→phone (edge crossing, UHID through the helper, tier 2 fallback) and phone-as-trackpad.
 20. Tablet as a second display (orchestrated Sunshine/Apollo + Moonlight first).
@@ -291,7 +340,7 @@ generated by the script (no binary fixtures in the repo). Nothing is installed; 
 
 ## Verification
 - `pytest windows/tests` and `gradlew :app:testDebugUnitTest` — both pass identical vectors.
-- `python windows/e2e/device.py` on the vivo — every scenario in "Scenario tests" passes.
+- `python windows/e2e/device.py` (and `--pairing` when pairing or endpoints change) on the vivo — every scenario in "Tests" passes or is a listed XFAIL.
 - E2E: copy on PC → appears on phone (<1s); copy in any phone app → appears on PC; repeat copies, no ping-pong (check logs show drops).
 - Security: wrong PSK or unknown device rejected (4401); unpaired device disconnected (4401); rogue server (wrong PSK) rejected by phone before any clip sent; tampered/replayed frame closes connection (Python test).
 - Resilience: toggle phone Wi-Fi; PC sleep 10 min → resume; switch PC networks (IP change → re-announce); reboot phone (auto-start); reboot PC/log off-on (task starts, single instance); kill pythonw (restarts ≤1 min); `adb shell am kill` / force background 1h (vivo killer).

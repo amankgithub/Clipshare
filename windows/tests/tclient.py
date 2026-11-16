@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from typing import Any
 
+import pytest
 from websockets.asyncio.client import ClientConnection, connect
+from websockets.exceptions import ConnectionClosed
 
 from clipbridge.link import crypto, envelope
 from clipbridge.link.handshake import b64d, b64e
 
 PSK = bytes(range(32))
 FEATURES = {"clipboard": 1, "files": 1}
+DATA = "clipbridge.data.v1"
 
 
 class MemoryDevices:
@@ -96,3 +100,40 @@ async def until_connected(link: Any, device: str, timeout: float = 5.0) -> None:
     while not any(p.device == device for p in link.peers):
         assert loop.time() < deadline, f"{device} never connected"
         await asyncio.sleep(0.01)
+
+
+# -- file transfer helpers (phone side of PROTOCOL.md 6.3) ------------------------
+
+
+async def connect_data(port: int, device: str = "phone") -> TestClient:
+    """A data connection (`clipbridge.data.v1`) for `device`."""
+    return await TestClient.connect(port, PSK, device, DATA)
+
+
+def fid(n: int = 1) -> str:
+    return f"{n:032x}"
+
+
+def offer(id_: str, name: str, size: int) -> dict[str, Any]:
+    return {"ch": "link", "type": "xfer_offer", "id": id_, "feature": "files", "name": name, "size": size, "meta": {}}
+
+
+async def recv(c: TestClient, timeout: float = 10) -> dict[str, Any]:
+    header, _ = await asyncio.wait_for(c.recv(), timeout)
+    return header
+
+
+async def stream(d: TestClient, data: bytes, chunk: int = 64 * 1024) -> None:
+    for i in range(0, len(data), chunk):
+        await d.send({"ch": "link", "type": "xfer_data"}, data[i : i + chunk])
+
+
+async def closed_code(c: TestClient) -> int:
+    with pytest.raises(ConnectionClosed):
+        while True:
+            await asyncio.wait_for(c.ws.recv(), 5)
+    return c.ws.protocol.close_rcvd.code
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()

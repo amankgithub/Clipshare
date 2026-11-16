@@ -4,7 +4,8 @@ Zero-cloud, LAN-only secure link between a Windows laptop (server) and Android d
 Features on that link: clipboard sync and file transfer (`files`). Full plan: `docs/PLAN.md`. Wire spec: `protocol/PROTOCOL.md`.
 
 ## Layout
-- `windows/` Python >= 3.10 package `clipbridge` (`src/clipbridge/link/`, `src/clipbridge/features/`), tests in `windows/tests/`.
+- `windows/` Python >= 3.10 package `clipbridge` (`src/clipbridge/link/`, `src/clipbridge/features/`), tests in `windows/tests/`,
+  device runner in `windows/e2e/` (drives the real PC task and the phone over adb; not part of pytest).
 - `android/` Kotlin app, single `app` module, package `com.clipbridge` (`link.*`, `features.<name>.*`).
 - `protocol/` `PROTOCOL.md` (normative), `gen_vectors.py`, `test_vectors.json` (shared by both test suites).
 - `docs/` plan, `FOOTPRINT.md` (everything installed on either device + how to remove it). `spike/` is a throwaway experiment: ignored, never committed.
@@ -34,7 +35,11 @@ Write it as if the project had been designed with it from day one:
 - Regenerate vectors: `python protocol/gen_vectors.py` (deterministic; must not change the file unless the spec changes)
 - Android unit tests (PowerShell):
   `$env:JAVA_HOME="C:\Program Files\Android\Android Studio\jbr"; android/gradlew :app:testDebugUnitTest`
-  (system Java is too new for AGP; always use the Android Studio JBR)
+  (system Java is too new for AGP; always use the Android Studio JBR). Includes the Kotlin↔Python interop
+  tests, which start `windows/tests/interop_server.py` with `windows/.venv` (skipped if the venv is missing).
+- Device run (vivo on USB, unlocked, debug APK installed, `ClipBridge` task running), from a normal terminal
+  (the tool shell virtualizes `%LOCALAPPDATA%` and cannot read the PC log):
+  `windows/.venv/Scripts/python.exe windows/e2e/device.py [--quick] [--pairing] [--only N]`
 
 ## Conventions
 - Typed code (Python type hints everywhere; Kotlin explicit public types). Small, single-purpose modules.

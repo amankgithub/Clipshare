@@ -9,16 +9,14 @@ from pathlib import Path
 from typing import AsyncIterator
 
 import pytest
-from websockets.exceptions import ConnectionClosed
 
 from clipbridge.features.clipboard.feature import ClipboardFeature
 from clipbridge.features.files.feature import FilesFeature, unique_path
 from clipbridge.link import transfer
 from clipbridge.link.server import Link
 from clipbridge.link.transfer_core import CHUNK, CompletedIds, Range, rewind_full
-from tclient import PSK, MemoryDevices, TestClient, until_connected
+from tclient import PSK, MemoryDevices, TestClient, closed_code, connect_data, fid, offer, recv, sha, stream, until_connected
 
-DATA = "clipbridge.data.v1"
 log = logging.getLogger(__name__)
 
 
@@ -43,7 +41,7 @@ class Env:
         return client
 
     async def data(self, device: str = "phone") -> TestClient:
-        return await TestClient.connect(self.link.port, PSK, device, DATA)
+        return await connect_data(self.link.port, device)
 
 
 @pytest.fixture
@@ -52,35 +50,6 @@ async def env(tmp_path: Path) -> AsyncIterator[Env]:
     await e.link.start()
     yield e
     await e.link.stop()
-
-
-def fid(n: int = 1) -> str:
-    return f"{n:032x}"
-
-
-def offer(id_: str, name: str, size: int) -> dict:
-    return {"ch": "link", "type": "xfer_offer", "id": id_, "feature": "files", "name": name, "size": size, "meta": {}}
-
-
-async def recv(c: TestClient, timeout: float = 10) -> dict:
-    header, _ = await asyncio.wait_for(c.recv(), timeout)
-    return header
-
-
-async def stream(d: TestClient, data: bytes, chunk: int = 64 * 1024) -> None:
-    for i in range(0, len(data), chunk):
-        await d.send({"ch": "link", "type": "xfer_data"}, data[i : i + chunk])
-
-
-async def closed_code(c: TestClient) -> int:
-    with pytest.raises(ConnectionClosed):
-        while True:
-            await asyncio.wait_for(c.ws.recv(), 5)
-    return c.ws.protocol.close_rcvd.code
-
-
-def sha(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 def partials(env: Env) -> list[str]:
